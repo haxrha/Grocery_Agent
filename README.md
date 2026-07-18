@@ -1,5 +1,17 @@
 # Grocery_Agent
 
+# we built a group-ordering agent you text like a roommate. Introducing, hungry henry!
+
+35% of your order on DoorDash could just be delivery fees alone and most DoorDash orders happen during lunch or dinner anyways. So to get a group order, instead of sending links, sharing carts, and figuring out who to zelle and how much - Hungry Henry just lives inside your iMessage group chat and does the searching, ordering and splitting the bill for you!
+
+Why in iMessage? Hungry Henry doesn't need other users to have a DoorDash account or app and users don't need to do a lengthy search, all they need to do is send one iMessage. 
+
+Hungry Henry will also automatically find the best deal nearest to the batch order after just hearing a suggestion of what you want. You can also talk to Hungry Henry in your DMs directly if you need help figuring out what works best for you and he'll help you out!
+
+Hungry Henry also makes reciepts for the bill which was split so users can upload it to their ramp accounts if needed :)
+
+
+
 Group DoorDash ordering with an iMessage front door: text your grocery
 list to the agent, confirm the resolved order over iMessage, and your
 items join the next shared group run — all visible on a dispatch
