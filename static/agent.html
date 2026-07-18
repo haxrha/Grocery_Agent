@@ -112,14 +112,14 @@ async function refresh(){
     html += '<table><tr><th>Receipt</th><th>Total</th><th></th><th></th></tr>' +
       session.receipts.map(r=>`<tr><td>${esc(r.name)}</td><td>$${r.total.toFixed(2)}</td>
         <td><a href="/receipts/${r.id}" target="_blank">receipt 🧾</a></td>
-        <td>${r.paid?'paid ✅':`<a href="${esc(r.venmo_url)}" target="_blank">venmo →</a>`}</td></tr>`).join('') +
+        <td>${r.paid?'paid ✅':`<a href="${esc(r.pay_url||r.venmo_url)}" target="_blank">pay →</a>`}</td></tr>`).join('') +
       '</table>';
   }
   $('state').innerHTML = html || '<span class="muted">No items yet.</span>';
 }
 
 fetch('/api/health').then(r=>r.json()).then(h=>{
-  $('health').textContent = `DoorDash: ${h.doordash} · Ramp: ${h.ramp.mode} · parser: ${h.llm.model}`;
+  $('health').textContent = `DoorDash: ${h.doordash} · payments: ${h.payments.mode} · parser: ${h.llm.model}`;
 });
 refresh();
 </script>
