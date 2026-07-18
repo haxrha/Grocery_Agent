@@ -238,7 +238,16 @@ def add_to_cart(store_id, menu_id, resolved):
     add_args = ["cart", "add-items", "--store-id", str(store_id),
                 "--menu-id", str(menu_id), "--items-json", json.dumps(cart_items)]
     if existing_uuid:
-        add_args += ["--cart-uuid", existing_uuid]
+        try:
+            return run_dd(*add_args, "--cart-uuid", existing_uuid), existing_uuid
+        except DDError as e:
+            if is_store_closed(e):
+                raise
+            # Stale/expired cart — retry into a fresh one instead of dying
+            # on backend validation errors like "session_id is required".
+            sys.stderr.write(f"append to cart {existing_uuid} failed ({e}); "
+                             "retrying with a fresh cart\n")
+            return run_dd(*add_args), None
     return run_dd(*add_args), existing_uuid
 
 
@@ -340,13 +349,31 @@ def place_bulk_order(body):
 STATE_LOCK = threading.Lock()
 STATE = {
     "next_fire_at": 0.0,
-    "batch": [],       # [{person, items: [{name, quantity, est?}], joined_at, chat_id?}]
+    "batch": [],       # [{person, items, joined_at, chat_id?, in_cart?, resolved?}]
     "deals": [],       # [{store, title, threshold, posted_by}]
     "events": [],      # [{at, text}] newest first
     "last_order": None,
+    "run_store": None,  # {store_id, store_name} — first confirm pins the run's store
 }
 
-DURABLE_KEYS = ("next_fire_at", "batch", "deals", "events", "last_order")
+DURABLE_KEYS = ("next_fire_at", "batch", "deals", "events", "last_order",
+                "run_store")
+
+
+def get_run_store():
+    with STATE_LOCK:
+        return STATE.get("run_store")
+
+
+def set_run_store(store_id, store_name):
+    """Pin the current run to one store so everyone lands in the same cart."""
+    if not store_id:
+        return
+    with STATE_LOCK:
+        if not STATE.get("run_store"):
+            STATE["run_store"] = {"store_id": str(store_id),
+                                  "store_name": store_name}
+            save_state()
 
 
 STATE_LOADED = False  # guards save_state so a bare import can't clobber state.json
@@ -425,6 +452,12 @@ def batch_join(body):
     entry = {"person": person, "items": items, "joined_at": time.time()}
     if body.get("chat_id"):  # iMessage joiners get notified when the batch fires
         entry["chat_id"] = str(body["chat_id"])
+    if body.get("in_cart"):  # already sitting in the DoorDash cart
+        entry["in_cart"] = True
+        if body.get("resolved"):
+            entry["resolved"] = body["resolved"]
+        if body.get("cart_uuid"):
+            entry["cart_uuid"] = body["cart_uuid"]
     with STATE_LOCK:
         STATE["batch"].append(entry)
         save_state()
@@ -496,28 +529,48 @@ def batch_receipts(entries, result):
 
 
 def fire_batch():
-    """Merge everyone's items and send the combined order to the cart."""
+    """Close the run: order anything not yet in the cart, then send receipts.
+    iMessage confirms are already in the cart (in_cart); only API-queued
+    entries still need ordering."""
     with STATE_LOCK:
         entries = list(STATE["batch"])
         deals = list(STATE["deals"])
-    merged = {}
-    for entry in entries:
-        for it in entry["items"]:
-            key = it["name"].strip().lower()
-            slot = merged.setdefault(key, {"name": it["name"], "quantity": 0})
-            slot["quantity"] += it["quantity"]
-    body = {"items": [{"name": v["name"], "quantity": clean_qty(v["quantity"])}
-                      for v in merged.values()]}
-    if deals and deals[0].get("store"):
-        body["store_name"] = deals[0]["store"]
-    push_event(f"Timer hit zero, sending {len(body['items'])} items for {len(entries)} people")
-    try:
-        _, result = place_bulk_order(body)
-    except DDError as e:
-        result = {"ok": False, "error": str(e)}
-    except Exception as e:
-        result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        run_store = STATE.get("run_store")
+    to_order = [e for e in entries if not e.get("in_cart")]
+    if to_order:
+        merged = {}
+        for entry in to_order:
+            for it in entry["items"]:
+                key = it["name"].strip().lower()
+                slot = merged.setdefault(key, {"name": it["name"], "quantity": 0})
+                slot["quantity"] += it["quantity"]
+        body = {"items": [{"name": v["name"], "quantity": clean_qty(v["quantity"])}
+                          for v in merged.values()]}
+        if run_store:
+            body["store_id"] = run_store["store_id"]
+            body["store_name"] = run_store.get("store_name")
+        elif deals and deals[0].get("store"):
+            body["store_name"] = deals[0]["store"]
+        push_event(f"Timer hit zero, sending {len(body['items'])} queued items "
+                   f"for {len(entries)} people")
+        try:
+            _, result = place_bulk_order(body)
+        except DDError as e:
+            result = {"ok": False, "error": str(e)}
+        except Exception as e:
+            result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    else:
+        result = {"ok": True,
+                  "store_name": (run_store or {}).get("store_name") or "the store",
+                  "resolved": [],
+                  "notes": "everything was already in the cart"}
+        push_event("Run closing — everyone's items are already in the cart")
     if result.get("ok"):
+        combined = list(result.get("resolved") or [])
+        for e in entries:
+            if e.get("in_cart"):
+                combined += e.get("resolved") or []
+        result["resolved"] = combined
         receipts = batch_receipts(entries, result)
         if receipts:
             result["receipts"] = receipts
@@ -525,6 +578,7 @@ def fire_batch():
         STATE["last_order"] = result
         if result.get("ok"):
             STATE["batch"] = []
+            STATE["run_store"] = None
         save_state()
     if result.get("ok"):
         push_event(f"Order sent to the {result.get('store_name')} cart, review and check out")
@@ -1095,6 +1149,34 @@ def resolve_bulk(body, items):
             "delivery_address": gl.get("delivery_address")}
 
 
+def execute_pending(pending):
+    """Place a confirmed pending order, falling back to other stores if closed."""
+    try:
+        added, existing = add_to_cart(pending["store_id"], pending["menu_id"],
+                                      pending["resolved"])
+        return build_response(added, existing, pending["resolved"],
+                              pending["notes"], pending["items"],
+                              pending["store_id"], pending["store_name"],
+                              pending.get("delivery_address"))
+    except DDError as e:
+        if not is_store_closed(e):
+            raise
+    tried = {pending["store_id"]}
+    for alt_id, alt_name in pending.get("alt_stores", [])[:6]:
+        if alt_id in tried:
+            continue
+        tried.add(alt_id)
+        note = (f"{pending['store_name']} wasn't accepting orders, "
+                f"used {alt_name} instead")
+        try:
+            return order_at_store(alt_id, alt_name, pending["items"], [note])
+        except DDError as e:
+            if is_store_closed(e):
+                continue
+            raise
+    raise DDError("No nearby store is accepting this order right now.")
+
+
 def preview_items(resolved):
     return [{"name": it["name"], "quantity": clean_qty(it.get("quantity", 1)),
              "price": it.get("price"), "unit": it.get("measurement_unit")}
@@ -1170,36 +1252,42 @@ def handle_conversation(chat_id, text, sender, params, entry, is_group=False):
 
         if kind == "confirm" and pending:
             person = batch_person(pending.get("sender") or sender)
-            _, result = batch_join({"person": person,
-                                    "items": pending["batch_items"],
-                                    "chat_id": chat_id})
+            entry["status"] = "ordering"
+            try:
+                _, result = execute_pending(pending)  # into the cart right now
+            except DDError as e:
+                result = {"ok": False, "error": str(e)}
             with PENDING_LOCK:
                 PENDING_ORDERS.pop(pkey, None)
             if result.get("ok"):
-                est = approx_total(pending["resolved"])
+                set_run_store(result.get("store_id"), result.get("store_name"))
+                batch_join({"person": person, "items": pending["batch_items"],
+                            "chat_id": chat_id, "in_cart": True,
+                            "resolved": result.get("resolved"),
+                            "cart_uuid": result.get("cart_uuid")})
+                est = approx_total(result.get("resolved") or pending["resolved"])
                 ORDERS.appendleft({
                     "confirmed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "person": person,
                     "items": pending["batch_items"],
                     "est_total": round(est, 2),
-                    "store_hint": pending.get("store_name"),
-                    "status": "joined_batch",
+                    "store_hint": result.get("store_name"),
+                    "cart_uuid": result.get("cart_uuid"),
+                    "status": "in_cart",
                 })
-                mins = minutes_to_fire()
-                when = f"in ~{mins} min" if mins else "soon"
                 entry["status"] = "done"
-                entry["result"] = {"ok": True, "joined_batch": True,
-                                   "person": person, "est_total": round(est, 2)}
-                who = f"{person} is" if is_group else "You're"
+                entry["result"] = result
+                who = f"{person}'s items are" if is_group else "Your items are"
+                note = f" ({result['notes']})" if result.get("notes") else ""
                 send_linq_message(chat_id,
-                                  f"{who} on the run — {len(pending['batch_items'])} "
-                                  f"item(s), est ${est:.2f}. The group order goes out "
-                                  f"{when} (pickup: {DROP_POINT['name']}). "
-                                  "I'll text here when it's sent.")
+                                  f"{who} in the DoorDash cart at "
+                                  f"{result.get('store_name')} now — est "
+                                  f"${est:.2f}.{note} Receipts go out with the "
+                                  "group run.")
             else:
                 entry["status"] = "failed"
                 entry["result"] = result
-                send_linq_message(chat_id, "Sorry — couldn't add you to the run: "
+                send_linq_message(chat_id, "Sorry — couldn't add that to the cart: "
                                   f"{result.get('error')}")
         elif kind == "cancel" and pending:
             with PENDING_LOCK:
@@ -1220,6 +1308,10 @@ def handle_conversation(chat_id, text, sender, params, entry, is_group=False):
             entry["status"] = "resolving"
             body = {k: params[k][0] for k in ("store_id", "store_name")
                     if params.get(k)}
+            run_store = get_run_store()
+            if not body and run_store:  # keep the whole run in one cart
+                body = {"store_id": run_store["store_id"],
+                        "store_name": run_store.get("store_name")}
             res = resolve_bulk(body, items)
             # batch entries keep the short requested names; est comes from
             # the resolution when it lines up 1:1
