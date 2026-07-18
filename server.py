@@ -571,9 +571,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            self.send_file(os.path.join(STATIC_DIR, "index.html"), "text/html; charset=utf-8")
-        elif self.path in ("/dashboard", "/dashboard.html"):
+        if self.path in ("/", "/index.html", "/dashboard", "/dashboard.html"):
             self.send_file(os.path.join(STATIC_DIR, "dashboard.html"), "text/html; charset=utf-8")
         elif self.path == "/api/dashboard":
             self.handle_api(lambda: (200, dashboard_payload()))
