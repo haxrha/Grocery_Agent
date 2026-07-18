@@ -504,6 +504,7 @@
     <section class="card">
       <h2>On this order <span class="count" id="rider-count"></span></h2>
       <div id="roster-rows"><div class="empty">Nobody has joined the batch yet.</div></div>
+      <div id="imessage-awaiting"></div>
     </section>
 
     <section class="card" id="text-block">
@@ -646,6 +647,20 @@ function renderRoster(batch) {
   }).join('');
 }
 
+function renderIMessage(im) {
+  const box = $('imessage-awaiting');
+  const awaiting = (im && im.awaiting) || [];
+  if (!awaiting.length) { box.innerHTML = ''; return; }
+  box.innerHTML = awaiting.map(p => {
+    const mins = Math.max(1, Math.round(p.age_seconds / 60));
+    const items = p.summary.split('\n').slice(1).map(l =>
+      l.replace(/^-\s*/, '')).join(' · ');
+    return `<div class="rider" style="opacity:.55">
+      <div class="who">${esc(p.person)}</div>
+      <div class="what">⏳ awaiting YES (${mins}m) — ${esc(items)}</div></div>`;
+  }).join('');
+}
+
 function renderTicker(events) {
   if (!events.length) {
     if (!$('ticker-inner').classList.contains('scroll'))
@@ -701,6 +716,7 @@ async function poll() {
     renderStatus(r.driver);
     renderDeals(r.deals, r.batch_totals.est_subtotal);
     renderRoster(r.batch);
+    renderIMessage(r.imessage);
     renderTicker(r.events);
   } catch (e) {
     $('status-text').textContent = 'Reconnecting';
