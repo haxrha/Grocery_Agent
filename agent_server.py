@@ -31,7 +31,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import llm
-import ramp
+import payments
 import store
 from server import DDError, place_bulk_order
 
@@ -102,9 +102,9 @@ def do_checkout(group_id, store_name=None, store_id=None):
         return http_status, {"ok": False, "error": result.get("error"),
                              "requested": items}
 
-    charge = ramp.charge(0, memo=f"Group order {group_id}")
-    receipts = ramp.build_receipts(session, result.get("resolved"), charge)
-    charge["amount"] = ramp.order_total(receipts)
+    receipts = payments.build_receipts(session, result.get("resolved"))
+    charge = payments.charge(payments.order_total(receipts),
+                             memo=f"Group order {group_id}")
 
     def apply(sess):
         sess["status"] = "ordered"
@@ -226,7 +226,7 @@ def handle_message(body):
         lines = [f"✅ Order placed at {r.get('store_name')} on the company card "
                  f"({session['charge']['card']}). Total ${session['charge']['amount']:.2f}."]
         for rcpt in session["receipts"]:
-            lines.append(f"• {rcpt['name']}: ${rcpt['total']:.2f} → {rcpt['venmo_url']}")
+            lines.append(f"• {rcpt['name']}: ${rcpt['total']:.2f} → {rcpt['pay_url']}")
         if r.get("notes"):
             lines.append(f"ℹ️ {r['notes']}")
         reply = "\n".join(lines)
@@ -285,6 +285,14 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         return json.loads(self.rfile.read(length) or b"{}")
 
+    def fresh_receipt(self, receipt_id):
+        """Find a receipt, refreshing its Stripe payment status first."""
+        sess, rcpt = store.find_receipt(receipt_id)
+        if rcpt and not rcpt["paid"]:
+            sess = store.update(sess["id"], payments.refresh_receipts)
+            rcpt = next(r for r in sess["receipts"] if r["id"] == receipt_id)
+        return sess, rcpt
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -305,26 +313,29 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "doordash": "mock (dd-cli not on PATH)" if MOCK_DD else "dd-cli",
                 "llm": llm.parser_status(),
-                "ramp": ramp.status(),
+                "payments": payments.status(),
             })
         elif path == "/api/groups":
             self.send_json(200, {"ok": True, "groups": store.all_sessions()})
         elif path.startswith("/api/groups/"):
-            sess = store.peek(urllib.parse.unquote(path.split("/")[3]))
+            group_id = urllib.parse.unquote(path.split("/")[3])
+            sess = store.peek(group_id)
             if sess:
+                if sess.get("receipts"):
+                    sess = store.update(group_id, payments.refresh_receipts)
                 self.send_json(200, {"ok": True, "session": sess})
             else:
                 self.send_json(404, {"ok": False, "error": "no such group"})
         elif path.startswith("/api/receipts/"):
-            _, rcpt = store.find_receipt(path.split("/")[3])
+            sess, rcpt = self.fresh_receipt(path.split("/")[3])
             if rcpt:
                 self.send_json(200, {"ok": True, "receipt": rcpt})
             else:
                 self.send_json(404, {"ok": False, "error": "no such receipt"})
         elif path.startswith("/receipts/"):
-            sess, rcpt = store.find_receipt(path.split("/")[2])
+            sess, rcpt = self.fresh_receipt(path.split("/")[2])
             if rcpt:
-                self.send_html(ramp.receipt_html(sess, rcpt))
+                self.send_html(payments.receipt_html(sess, rcpt))
             else:
                 self.send_json(404, {"ok": False, "error": "no such receipt"})
         else:
@@ -365,7 +376,7 @@ def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("AGENT_PORT", 8766))
     print(f"Group-order bot on http://127.0.0.1:{port}"
           f"  (DoorDash: {'MOCK' if MOCK_DD else 'dd-cli'}, "
-          f"Ramp: {'live ' + ramp.RAMP_ENV if ramp.is_live() else 'mock'})")
+          f"payments: {payments.mode()})")
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 

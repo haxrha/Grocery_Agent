@@ -194,8 +194,12 @@ The server binds to 127.0.0.1 only.
 
 A second backend for the payments half: teammates text a bot in a group
 chat, an LLM parses each message, the group's items aggregate into ONE
-DoorDash order paid on a company **Ramp card**, and everyone gets an
-itemized receipt with a Venmo link.
+DoorDash order fronted by a company card, and everyone pays their share
+through a **Stripe Checkout** link on an itemized receipt (auto-marked
+paid). The actual DoorDash charge rides the card saved in the DoorDash
+account dd-cli is signed into — Stripe test cards can't pay real
+merchants. (`ramp.py`, the earlier Ramp-card variant, is kept in the tree
+in case we switch back.)
 
 ```
 iMessage relay ──POST /api/message──▶ agent_server.py ──▶ LLM parse (intent+items)
@@ -228,10 +232,10 @@ Env vars (all optional):
 | `ANTHROPIC_API_KEY` | LLM message parsing via the Anthropic SDK (best). Falls back to the `claude` CLI, then regex. |
 | `PARSE_MODEL` | Parser model, default `claude-opus-4-8` |
 | `MOCK_DD=1` | Force mock DoorDash even if dd-cli exists |
-| `RAMP_CLIENT_ID` / `RAMP_CLIENT_SECRET` | Ramp developer API (client-credentials). Without them: mock card. |
-| `RAMP_ENV` | `demo` (default, sandbox) or `prod` |
-| `RAMP_CARD_ID` | Pin a specific card, else first active card |
-| `VENMO_HANDLE` | Recipient of everyone's shares (the card owner) |
+| `STRIPE_SECRET_KEY` | Stripe secret key (`sk_test_…`). Each receipt becomes a Stripe Checkout link and the server auto-marks it paid. Without it: Venmo links + manual "paid" texts. |
+| `STRIPE_ISSUING=1` | Also create a virtual "company card" via Stripe Issuing (test mode) and capture a simulated charge for the order total |
+| `BASE_URL` | Public base for Checkout success links, default `http://127.0.0.1:8766` |
+| `VENMO_HANDLE` | Fallback pay links when Stripe is off (the card owner's handle) |
 | `TAX_RATE`, `DELIVERY_FEE`, `SERVICE_FEE` | Split math, defaults 0.08875 / 4.99 / 2.50 |
 | `AGENT_PORT` | Default 8766 |
 
@@ -258,7 +262,7 @@ is `ordered` until everyone pays (`settled`).
 
 Splits: each person pays for their own items (prices from the resolved
 DoorDash products) + proportional tax + an equal share of delivery/service
-fees; the whole order is fronted by the Ramp card. Ramp transactions post
-from the card network after settlement, so the charge record starts
-`pending_settlement` and is matched to the real Ramp transaction id when it
-appears.
+fees. With `STRIPE_SECRET_KEY` set, every receipt carries a Stripe Checkout
+link (test mode: pay with card `4242 4242 4242 4242`, any future expiry,
+any CVC) and the server polls the Checkout Session to flip receipts to
+paid automatically — no webhook/tunnel needed.
