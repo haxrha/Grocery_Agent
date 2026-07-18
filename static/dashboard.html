@@ -4,11 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#faf3ea">
-<title>Grocery Agent · Group Dispatch</title>
+<title>Hungry Henry · Group Dispatch</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@600;700;800&family=Quicksand:wght@500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@600;700;800&family=Chewy&family=Quicksand:wght@500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="/assets/intro-v2/intro.css">
 <style>
   :root {
     --cream: #faf3ea;
@@ -387,17 +388,92 @@
 </head>
 <body>
 
+<section class="opening-intro" id="opening-intro" aria-label="How Hungry Henry gathers and delivers food">
+  <div class="opening-copy">
+    <h1 class="hh-logo"><img src="/assets/grocery-bag.webp" alt="">Hungry Henry</h1>
+    <p class="opening-tagline">Good things come in group orders.</p>
+    <p class="opening-sub">Henry rolls the whole block's cravings into one shared run — one trip instead of six, one delivery fee split between neighbors, and group deals unlocked along the way.</p>
+    <div class="save-meter" id="save-meter"><b id="save-money">$0.00</b><span class="sep">·</span><b id="save-time">0 min</b><span class="save-label">saved</span></div>
+  </div>
+  <button class="intro-skip" id="intro-skip" type="button">Skip</button>
+
+  <div class="story-chat" aria-hidden="true">
+    <div class="story-chat-head"><span class="chat-title">🧺 block groceries</span><span class="chat-sub">6 people</span></div>
+    <div class="chat-b b1 them"><span class="who">maya</span>need milk + cereal. it's urgent 😭</div>
+    <div class="chat-b b2 them"><span class="who">jake</span>eggs x12. don't ask.</div>
+    <div class="chat-b b3 me"><span class="who">you</span>bananas x3 🍌</div>
+    <div class="chat-b b4 them"><span class="who">priya</span>bread + apples (rent week 🥲)</div>
+    <div class="chat-b b5 henry"><span class="who">hungry henry</span>say less — one car for everybody, leaving in 5 🚗</div>
+  </div>
+
+  <div class="intro-stage" aria-hidden="true">
+    <div class="intro-route"></div>
+
+    <figure class="story-store store-produce">
+      <img src="/assets/intro-v2/store-produce.webp" alt="">
+    </figure>
+    <figure class="story-store store-bakery">
+      <img src="/assets/intro-v2/store-bakery.webp" alt="">
+    </figure>
+    <figure class="story-store store-pantry">
+      <img src="/assets/intro-v2/store-pantry.webp" alt="">
+    </figure>
+
+    <figure class="story-house">
+      <img src="/assets/intro-v2/house.webp" alt="">
+    </figure>
+
+    <img class="pickup-food pickup-1" src="/assets/intro-v2/food-apple.webp" alt="">
+    <img class="pickup-food pickup-2" src="/assets/intro-v2/food-kale.webp" alt="">
+    <img class="pickup-food pickup-7" src="/assets/intro-v2/food-apple.webp" alt="">
+    <img class="pickup-food pickup-3" src="/assets/intro-v2/food-bread.webp" alt="">
+    <img class="pickup-food pickup-4" src="/assets/intro-v2/food-bread.webp" alt="">
+    <img class="pickup-food pickup-5 food-milk" src="/assets/intro-v2/food-milk.webp" alt="">
+    <img class="pickup-food pickup-6 food-milk" src="/assets/intro-v2/food-milk.webp" alt="">
+    <img class="pickup-food pickup-8" src="/assets/intro-v2/food-kale.webp" alt="">
+
+    <div class="story-car">
+      <div class="story-car-bob">
+        <img src="/assets/intro-v2/car-empty.webp" alt="">
+        <img class="story-car-loaded" src="/assets/delivery-car-loaded.webp" alt="">
+      </div>
+    </div>
+
+    <img class="home-food home-food-1" src="/assets/intro-v2/food-apple.webp" alt="">
+    <img class="home-food home-food-2" src="/assets/intro-v2/food-bread.webp" alt="">
+    <img class="home-food home-food-3" src="/assets/intro-v2/food-kale.webp" alt="">
+    <img class="home-food home-food-4 food-milk" src="/assets/intro-v2/food-milk.webp" alt="">
+    <div class="arrival-ring"></div>
+
+    <div class="big-caption" id="big-caption"></div>
+
+    <div class="goal-meter" id="goal-meter">
+      <div class="goal-title">Group cart</div>
+      <div class="goal-label" id="goal-label">So close — <b>$4 to go</b> for the bulk deal!</div>
+      <div class="goal-bar"><i id="goal-fill"></i></div>
+    </div>
+
+    <div class="late-bubble" aria-hidden="true"><span class="who">leo</span>WAIT add hot sauce 🌶️🌶️</div>
+  </div>
+
+  <div class="opening-status-wrap">
+    <p class="opening-status" id="opening-status" aria-live="polite">Getting the neighborhood ready…</p>
+    <div class="opening-progress"></div>
+  </div>
+</section>
+
 <header>
   <div class="brand">
     <img src="/assets/grocery-bag.webp" alt="">
     <div>
-      <div class="brand-name">Grocery Agent</div>
+      <div class="brand-name">Hungry Henry</div>
       <div class="brand-sub">Group dispatch</div>
     </div>
   </div>
   <span class="demo-tag" id="demo-tag">Demo data</span>
   <div class="drop" id="drop">Drop: <b>…</b></div>
   <div class="chip" id="status-chip"><span class="dot"></span><span id="status-text">Connecting</span></div>
+  <button class="intro-replay" id="intro-replay" type="button">Replay</button>
   <button class="order-link" id="order-open" type="button">Order online →</button>
 </header>
 
@@ -437,7 +513,7 @@
       </div>
       <div class="copy">
         <h2>Join by text</h2>
-        Text your list to <b>Grocery Agent</b> in iMessage — your items hop on
+        Text your list to <b>Hungry Henry</b> in iMessage — your items hop on
         the next group run automatically.
       </div>
     </section>
@@ -468,6 +544,7 @@
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/assets/intro-v2/intro.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
