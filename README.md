@@ -5,6 +5,11 @@ list to the agent, confirm the resolved order over iMessage, and your
 items join the next shared group run — all visible on a dispatch
 dashboard. Backed by `dd-cli`.
 
+A second service, **`agent_server.py`**, adds the payments layer: one
+company **Ramp card** fronts the whole group order and everyone gets an
+itemized receipt with a Venmo link — see
+[Group-order bot with Ramp splits](#group-order-bot-with-ramp-splits-agent_serverpy).
+
 ## Requirements
 
 - `dd-cli` on PATH, signed in (`dd-cli login`)
@@ -149,3 +154,76 @@ review and submit in DoorDash (or `dd-cli order submit`).
 4. **Add** — `dd-cli cart add-items` with the whole list in one call.
 
 The server binds to 127.0.0.1 only.
+
+## Group-order bot with Ramp splits (`agent_server.py`)
+
+A second backend for the payments half: teammates text a bot in a group
+chat, an LLM parses each message, the group's items aggregate into ONE
+DoorDash order paid on a company **Ramp card**, and everyone gets an
+itemized receipt with a Venmo link.
+
+```
+iMessage relay ──POST /api/message──▶ agent_server.py ──▶ LLM parse (intent+items)
+                                          │
+             frontend ◀── /api/groups ────┤  aggregate per group chat
+                                          ▼  on "send it":
+                              server.py bridge (dd-cli) → DoorDash cart
+                                          ▼
+                              Ramp card charge + per-person receipts
+                                          ▼
+                              Venmo links back to the group chat
+```
+
+### Run
+
+```
+python agent_server.py           # http://127.0.0.1:8766
+```
+
+Works with **zero setup** in demo mode: if `dd-cli` isn't on PATH it fakes
+DoorDash resolution (labeled MOCK), and without Ramp creds it uses a mock
+card. Open http://127.0.0.1:8766 for a debug console that simulates the
+group chat (with a one-click 3-person demo). Needs `pip install anthropic`
+for SDK parsing; otherwise it falls back to the `claude` CLI, then regex.
+
+Env vars (all optional):
+
+| Var | Purpose |
+|---|---|
+| `ANTHROPIC_API_KEY` | LLM message parsing via the Anthropic SDK (best). Falls back to the `claude` CLI, then regex. |
+| `PARSE_MODEL` | Parser model, default `claude-opus-4-8` |
+| `MOCK_DD=1` | Force mock DoorDash even if dd-cli exists |
+| `RAMP_CLIENT_ID` / `RAMP_CLIENT_SECRET` | Ramp developer API (client-credentials). Without them: mock card. |
+| `RAMP_ENV` | `demo` (default, sandbox) or `prod` |
+| `RAMP_CARD_ID` | Pin a specific card, else first active card |
+| `VENMO_HANDLE` | Recipient of everyone's shares (the card owner) |
+| `TAX_RATE`, `DELIVERY_FEE`, `SERVICE_FEE` | Split math, defaults 0.08875 / 4.99 / 2.50 |
+| `AGENT_PORT` | Default 8766 |
+
+### API (for the iMessage relay + frontend)
+
+```
+POST /api/message                {"sender": "+1555…", "name": "Alex",
+                                  "group_id": "chat-guid", "text": "2 burritos"}
+     → {"ok", "reply", "parsed", "session"}   # send `reply` back to the chat
+
+GET  /api/groups                 all group sessions (frontend feed)
+GET  /api/groups/<id>            one session: participants, items, charge, receipts
+POST /api/groups/<id>/checkout   force checkout {"store_name"?, "store_id"?}
+POST /api/groups/<id>/settle     {"sender"} mark a share paid
+GET  /api/receipts/<rcpt-id>     receipt JSON
+GET  /receipts/<rcpt-id>         printable HTML receipt (share this link)
+GET  /api/health                 {doordash, llm, ramp} status
+```
+
+Bot understands: adding items ("2 burritos and a coke"), removing ("drop my
+coke"), "status", "order from Chipotle", checkout ("send it"), "cancel", and
+"paid"/"venmoed you". One session per `group_id`; after checkout the session
+is `ordered` until everyone pays (`settled`).
+
+Splits: each person pays for their own items (prices from the resolved
+DoorDash products) + proportional tax + an equal share of delivery/service
+fees; the whole order is fronted by the Ramp card. Ramp transactions post
+from the card network after settlement, so the charge record starts
+`pending_settlement` and is matched to the real Ramp transaction id when it
+appears.
