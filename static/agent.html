@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Group Order Bot — debug console</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         max-width: 860px; margin: 2rem auto; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.3rem; } h2 { font-size: 1.05rem; margin: 1.4rem 0 .4rem; }
+  input, button { font: inherit; padding: .45rem .6rem; border-radius: 6px;
+         border: 1px solid #999; box-sizing: border-box; }
+  #text { width: 100%; margin-top: .4rem; }
+  button { cursor: pointer; font-weight: 600; }
+  .row { display: flex; gap: .5rem; flex-wrap: wrap; }
+  .row input { flex: 1; min-width: 120px; }
+  #chat { border: 1px solid #999; border-radius: 8px; padding: .8rem 1rem;
+          min-height: 120px; max-height: 340px; overflow-y: auto; }
+  .msg { margin: .35rem 0; white-space: pre-wrap; }
+  .msg b { color: #1565c0; } .msg.bot b { color: #2e7d32; }
+  .muted { color: #777; font-size: .85rem; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { text-align: left; padding: .25rem .6rem .25rem 0; }
+  .pill { border: 1px solid #999; border-radius: 999px; padding: 0 .55rem;
+          font-size: .8rem; }
+  a { color: inherit; }
+</style>
+</head>
+<body>
+<h1>📱 Group Order Bot — debug console</h1>
+<p class="muted">Simulates the iMessage relay: each "text" is a
+<code>POST /api/message</code> with <code>{sender, name, group_id, text}</code>.
+The real relay hits the same endpoint. <span id="health"></span></p>
+
+<div class="row">
+  <input id="name" placeholder="Name (Alex)" value="Alex">
+  <input id="sender" placeholder="Phone (+1555…)" value="+15550001111">
+  <input id="group" placeholder="Group chat id" value="office-demo">
+</div>
+<input id="text" placeholder='Try: "2 chicken burritos and a diet coke"'>
+<p><button id="send">Send text 💬</button>
+   <button id="quick" type="button">▶ Run 3-person demo</button></p>
+
+<div id="chat"></div>
+
+<h2>Group state <span class="pill" id="gstatus"></span></h2>
+<div id="state" class="muted">No group yet.</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const chat = $('chat');
+
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function bubble(who, text, bot){
+  const d = document.createElement('div');
+  d.className = 'msg' + (bot ? ' bot' : '');
+  d.innerHTML = `<b>${esc(who)}:</b> ${esc(text)}`;
+  chat.appendChild(d); chat.scrollTop = chat.scrollHeight;
+}
+
+async function sendText(name, sender, text){
+  bubble(name, text);
+  const resp = await fetch('/api/message', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name, sender, group_id: $('group').value.trim() || 'default', text})});
+  const r = await resp.json();
+  bubble('🤖 bot', r.reply || r.error || '(no reply)', true);
+  await refresh();
+  return r;
+}
+
+$('send').onclick = async () => {
+  const t = $('text').value.trim(); if (!t) return;
+  $('text').value = '';
+  await sendText($('name').value.trim()||'anon', $('sender').value.trim()||'+10000000000', t);
+};
+$('text').addEventListener('keydown', e => { if (e.key === 'Enter') $('send').click(); });
+
+$('quick').onclick = async () => {
+  const g = $('group').value.trim() || 'office-demo';
+  const script = [
+    ['Alex',  '+15550001111', '2 chicken burritos and a diet coke'],
+    ['Sam',   '+15550002222', 'can i get a poke bowl and 2 waters'],
+    ['Riley', '+15550003333', 'fries x2 and a lemonade pls'],
+    ['Alex',  '+15550001111', 'status'],
+    ['Sam',   '+15550002222', 'send it'],
+    ['Riley', '+15550003333', 'venmoed you!'],
+  ];
+  for (const [n,s,t] of script) await sendText(n, s, t);
+};
+
+async function refresh(){
+  const g = $('group').value.trim() || 'default';
+  const resp = await fetch('/api/groups/' + encodeURIComponent(g));
+  if (!resp.ok) { $('state').textContent = 'No group yet.'; return; }
+  const {session} = await resp.json();
+  $('gstatus').textContent = session.status;
+  let html = '';
+  const people = Object.entries(session.participants||{});
+  if (people.length){
+    html += '<table><tr><th>Person</th><th>Items</th><th>Paid</th></tr>' +
+      people.map(([s,p]) => `<tr><td>${esc(p.name||s)}</td><td>${
+        (p.items||[]).map(i=>`${i.quantity}× ${esc(i.name)}`).join(', ')||'—'
+      }</td><td>${p.paid?'✅':''}</td></tr>`).join('') + '</table>';
+  }
+  if (session.charge){
+    html += `<p>💳 <b>${esc(session.charge.card)}</b> charged $${session.charge.amount.toFixed(2)}
+      <span class="pill">${esc(session.charge.status)}</span></p>`;
+  }
+  if ((session.receipts||[]).length){
+    html += '<table><tr><th>Receipt</th><th>Total</th><th></th><th></th></tr>' +
+      session.receipts.map(r=>`<tr><td>${esc(r.name)}</td><td>$${r.total.toFixed(2)}</td>
+        <td><a href="/receipts/${r.id}" target="_blank">receipt 🧾</a></td>
+        <td>${r.paid?'paid ✅':`<a href="${esc(r.venmo_url)}" target="_blank">venmo →</a>`}</td></tr>`).join('') +
+      '</table>';
+  }
+  $('state').innerHTML = html || '<span class="muted">No items yet.</span>';
+}
+
+fetch('/api/health').then(r=>r.json()).then(h=>{
+  $('health').textContent = `DoorDash: ${h.doordash} · Ramp: ${h.ramp.mode} · parser: ${h.llm.model}`;
+});
+refresh();
+</script>
+</body>
+</html>

@@ -8,3 +8,5 @@
 .last_deliveries.jsonl
 state.json
 __pycache__/
+*.pyc
+data/
