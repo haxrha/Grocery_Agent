@@ -10,4 +10,4 @@ state.json
 __pycache__/
 *.pyc
 data/
-.muted_chats
+.stripe_secret_key

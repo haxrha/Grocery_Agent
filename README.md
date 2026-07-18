@@ -126,11 +126,9 @@ also DM, and everyone in the group can order from then on. In groups
 Henry is silent unless mentioned: only messages containing "@henry"
 (or "@hungry henry") get processed — everything else is ignored and
 not even marked read. A bare YES/NO still works for a member with a
-pending confirmation. "!henry" mutes Henry for the whole chat (no
-replies, no read receipts, mentions ignored; persists across restarts
-in `.muted_chats`) and "!henry" again wakes him. Each member has their
-own pending order; confirmations in the group are addressed
-"For iMessage …1234". Adding someone to the group in Messages is all
+pending confirmation. Henry is always active — there is no mute.
+Each member has their own pending order; confirmations in the group
+are addressed "For iMessage …1234". Adding someone to the group in Messages is all
 it takes to onboard them.
 
 Security:

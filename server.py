@@ -52,6 +52,17 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
 DD_TIMEOUT = 180
 
+# Stripe receipts (payments.py reads STRIPE_SECRET_KEY at import time).
+_stripe_key_path = os.path.join(BASE_DIR, ".stripe_secret_key")
+if not os.environ.get("STRIPE_SECRET_KEY") and os.path.exists(_stripe_key_path):
+    with open(_stripe_key_path) as _f:
+        os.environ["STRIPE_SECRET_KEY"] = _f.read().strip()
+try:
+    import payments
+except Exception as _e:
+    payments = None
+    sys.stderr.write(f"payments module unavailable ({_e}); receipts disabled\n")
+
 # Group-order dispatch config
 BATCH_MINUTES = float(os.environ.get("BATCH_MINUTES", "30"))
 DEMO = os.environ.get("DEMO", "") not in ("", "0")
@@ -338,7 +349,12 @@ STATE = {
 DURABLE_KEYS = ("next_fire_at", "batch", "deals", "events", "last_order")
 
 
+STATE_LOADED = False  # guards save_state so a bare import can't clobber state.json
+
+
 def load_state():
+    global STATE_LOADED
+    STATE_LOADED = True
     if DEMO:
         return
     try:
@@ -353,7 +369,7 @@ def load_state():
 
 def save_state():
     """Persist durable state. Caller must hold STATE_LOCK."""
-    if DEMO:
+    if DEMO or not STATE_LOADED:
         return
     try:
         with open(STATE_PATH, "w") as f:
@@ -446,6 +462,39 @@ def set_timer(body):
     return 200, {"ok": True, "next_fire_at": STATE["next_fire_at"]}
 
 
+def batch_receipts(entries, result):
+    """Per-person Stripe receipts for a fired batch; text pay links to
+    iMessage joiners. Returns the receipts (or None)."""
+    if not payments or not entries:
+        return None
+    session = {"id": "run-" + time.strftime("%m%d-%H%M"), "participants": {}}
+    for e in entries:
+        part = session["participants"].setdefault(
+            e["person"], {"name": e["person"], "items": []})
+        part["items"] += [{"name": i["name"], "quantity": i.get("quantity", 1)}
+                          for i in e["items"]]
+    try:
+        receipts = payments.build_receipts(session, result.get("resolved"))
+    except Exception as e:
+        sys.stderr.write(f"receipt build failed: {e}\n")
+        return None
+    person_chat = {}
+    for e in entries:
+        if e.get("chat_id"):
+            person_chat.setdefault(e["person"], e["chat_id"])
+    for r in receipts:
+        chat_id = person_chat.get(r["name"])
+        if chat_id and r.get("pay_url"):
+            send_linq_message(chat_id,
+                              f"Receipt for {r['name']}: ${r['total']:.2f} "
+                              f"(items ${r['subtotal']:.2f} + tax ${r['tax']:.2f} "
+                              f"+ fee share ${r['fees_share']:.2f}). "
+                              f"Pay your share here: {r['pay_url']}")
+    push_event(f"Receipts out — ${payments.order_total(receipts):.2f} "
+               f"split {len(receipts)} way(s)")
+    return receipts
+
+
 def fire_batch():
     """Merge everyone's items and send the combined order to the cart."""
     with STATE_LOCK:
@@ -468,6 +517,10 @@ def fire_batch():
         result = {"ok": False, "error": str(e)}
     except Exception as e:
         result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    if result.get("ok"):
+        receipts = batch_receipts(entries, result)
+        if receipts:
+            result["receipts"] = receipts
     with STATE_LOCK:
         STATE["last_order"] = result
         if result.get("ok"):
@@ -803,32 +856,9 @@ def harvest_group_members(chat_id):
     return added
 
 
-# In group chats Henry only answers when mentioned ("@henry 2 milk, eggs")
-# and "!henry" toggles him silent/awake for the whole chat.
-GROUP_TRIGGER = re.compile(r"@(?:hungry\s*)?henry\b[\s,:!.-]*", re.I)
-MUTE_TOGGLE = re.compile(r"^\s*!\s*(?:hungry\s*)?henry\b", re.I)
-
-
-def load_muted_chats():
-    chats = set()
-    try:
-        with open(os.path.join(BASE_DIR, ".muted_chats")) as f:
-            chats = {line.strip() for line in f if line.strip()}
-    except OSError:
-        pass
-    return chats
-
-
-def set_chat_muted(chat_id, muted):
-    chats = load_muted_chats()
-    if muted:
-        chats.add(str(chat_id))
-    else:
-        chats.discard(str(chat_id))
-    path = os.path.join(BASE_DIR, ".muted_chats")
-    with open(path, "w") as f:
-        f.write("".join(c + "\n" for c in sorted(chats)))
-    os.chmod(path, 0o600)
+# Optional name prefix people naturally type ("henry bread", "@henry milk") —
+# stripped before interpretation, never required.
+HENRY_MENTION = re.compile(r"@?\s*(?:hungry\s*)?henry\b[\s,:!.-]*", re.I)
 
 
 def pending_key(chat_id, sender, is_group):
@@ -1451,12 +1481,10 @@ class Handler(BaseHTTPRequestHandler):
         raw_text = find_message_text(payload) or ""
 
         if is_group:
-            mute_hit = bool(MUTE_TOGGLE.match(raw_text))
-            mention = GROUP_TRIGGER.search(raw_text)
-            # Membership in a provisioned group chat IS the authorization —
-            # but provisioning itself takes an @henry from an authorized user.
+            # Membership in a provisioned group chat IS the authorization;
+            # any message from an authorized user provisions a new group.
             if chat_id not in load_authorized_chats():
-                if sender_known and (mention or mute_hit):
+                if sender_known:
                     if authorize_chat(chat_id,
                                       f"provisioned by {batch_person(sender)}"):
                         added = harvest_group_members(chat_id)
@@ -1466,37 +1494,13 @@ class Handler(BaseHTTPRequestHandler):
                         threading.Thread(target=send_linq_message, args=(
                             chat_id,
                             "Hungry Henry here — this group can now order "
-                            "groceries. Mention me with \"@henry\" + your list "
-                            "(e.g. \"@henry 2 milk, eggs\") and I'll confirm "
-                            "before it joins the group run. Send \"!henry\" "
-                            "any time to mute me, and \"!henry\" again to "
-                            "wake me up."), daemon=True).start()
+                            "groceries. Just text what you want (e.g. "
+                            "\"2 milk and eggs\") and I'll confirm before it "
+                            "joins the group run."), daemon=True).start()
                 else:
                     self.send_json(200, {"ok": True,
                                          "ignored": "group chat not provisioned"})
                     return
-            # "!henry" toggles Henry silent/awake for the whole chat.
-            if mute_hit:
-                muted = chat_id in load_muted_chats()
-                set_chat_muted(chat_id, not muted)
-                threading.Thread(target=send_read_receipt, args=(chat_id,),
-                                 daemon=True).start()
-                if muted:
-                    push_event("Henry unmuted in a group chat")
-                    threading.Thread(target=send_linq_message, args=(
-                        chat_id, "I'm back — mention @henry with a list "
-                        "whenever you're hungry."), daemon=True).start()
-                else:
-                    push_event("Henry muted in a group chat")
-                    threading.Thread(target=send_linq_message, args=(
-                        chat_id, "Going quiet — send !henry again when you "
-                        "want me back."), daemon=True).start()
-                self.send_json(200, {"ok": True, "muted": not muted})
-                return
-            if chat_id in load_muted_chats():
-                # Fully silent: no processing, no read receipts, no replies.
-                self.send_json(200, {"ok": True, "ignored": "henry is muted here"})
-                return
         else:
             if authorized and sender and normalize_phone(sender) not in authorized:
                 self.send_json(200, {"ok": True,
@@ -1512,20 +1516,10 @@ class Handler(BaseHTTPRequestHandler):
         # Claude-driven confirm loop; a YES joins the group batch.
         is_native = bool(payload.get("items") or payload.get("text"))
         if not is_native and chat_id and raw_text:
-            text = raw_text
-            if is_group:
-                with PENDING_LOCK:
-                    has_pending = pending_key(chat_id, sender, True) in PENDING_ORDERS
-                if mention:
-                    text = (raw_text[:mention.start()]
-                            + raw_text[mention.end():]).strip() or raw_text
-                elif not has_pending:
-                    # Group banter without an @henry (and no pending order
-                    # whose YES/NO this could be) stays untouched — not
-                    # even marked read.
-                    self.send_json(200, {"ok": True, "marked_read": False,
-                                         "ignored": "not addressed to henry"})
-                    return
+            # Strip an optional "henry"/"@henry" prefix; Claude classifies
+            # everything else (banter comes back as "chat" and is ignored).
+            m = HENRY_MENTION.match(raw_text)
+            text = (raw_text[m.end():].strip() if m else raw_text) or raw_text
             threading.Thread(target=send_read_receipt, args=(chat_id,),
                              daemon=True).start()
             entry = {"received_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
