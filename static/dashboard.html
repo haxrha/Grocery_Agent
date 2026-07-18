@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Grocery Agent · Dispatch</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root {
+    --paper: #f7f6f2;
+    --surface: #ffffff;
+    --ink: #1f1e1a;
+    --muted: #6e6a5e;
+    --faint: #9a968b;
+    --line: #e4e1d8;
+    --line-strong: #cfcbbf;
+    --green: #2f5d3a;
+    --green-dark: #264d30;
+    --green-tint: #eef3ec;
+    --red: #a6432e;
+    --amber-text: #8a6d1f;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "Instrument Sans", sans-serif;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    height: 100vh;
+    overflow: hidden;
+  }
+  ::selection { background: var(--green-tint); }
+
+  /* ---------- header ---------- */
+  header {
+    display: flex; align-items: center; gap: 1.25rem;
+    padding: 0.85rem 1.5rem;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
+  }
+  .brand {
+    font-family: "Fraunces", serif;
+    font-weight: 600; font-size: 1.3rem; letter-spacing: -0.01em;
+    line-height: 1.15;
+  }
+  .brand em { font-style: normal; color: var(--green); }
+  .brand-sub { font-size: 0.78rem; color: var(--muted); }
+  .drop {
+    margin-left: auto; font-size: 0.85rem; color: var(--muted);
+  }
+  .drop b { color: var(--ink); font-weight: 600; }
+  .chip {
+    display: flex; align-items: center; gap: 0.45rem;
+    font-size: 0.8rem; font-weight: 500; color: var(--muted);
+    padding: 0.32rem 0.8rem;
+    background: var(--paper);
+    border: 1px solid var(--line-strong); border-radius: 999px;
+  }
+  .chip.green {
+    color: var(--green); background: var(--green-tint);
+    border-color: rgba(47, 93, 58, 0.35);
+  }
+  .chip .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: currentColor;
+    animation: breathe 2.4s ease-in-out infinite;
+  }
+  .demo-tag {
+    font-size: 0.7rem; font-weight: 500; letter-spacing: 0.05em;
+    color: var(--faint); text-transform: uppercase;
+    border: 1px solid var(--line); border-radius: 999px;
+    padding: 0.22rem 0.6rem; display: none;
+  }
+  @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+  /* ---------- main ---------- */
+  main {
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+    gap: 1rem; padding: 1rem;
+    min-height: 0;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line); border-radius: 12px;
+    min-height: 0;
+  }
+
+  /* map panel */
+  #map-panel { position: relative; overflow: hidden; }
+  #map { position: absolute; inset: 0; background: var(--paper); }
+  .leaflet-container { font: inherit; }
+  #driver-card {
+    position: absolute; left: 0.9rem; bottom: 0.9rem; z-index: 800;
+    background: var(--surface);
+    border: 1px solid var(--line); border-radius: 10px;
+    box-shadow: 0 4px 16px rgba(31, 30, 26, 0.1);
+    padding: 0.7rem 1rem;
+    max-width: 85%;
+  }
+  #driver-card .label {
+    font-size: 0.68rem; font-weight: 600; letter-spacing: 0.08em;
+    color: var(--muted); text-transform: uppercase; margin-bottom: 0.2rem;
+  }
+  #driver-card .line { font-size: 0.88rem; }
+  #driver-card .line b { font-weight: 600; }
+  #driver-card .line .eta { color: var(--green); font-weight: 600; }
+  .drv-marker { position: relative; }
+  .drv-marker .core {
+    position: absolute; left: 50%; top: 50%;
+    width: 12px; height: 12px; margin: -6px 0 0 -6px;
+    background: var(--green); border: 2px solid #fff; border-radius: 50%;
+    box-shadow: 0 1px 4px rgba(31, 30, 26, 0.35);
+  }
+  .drv-marker .ring {
+    position: absolute; left: 50%; top: 50%;
+    width: 12px; height: 12px; margin: -6px 0 0 -6px;
+    border: 2px solid var(--green); border-radius: 50%;
+    opacity: 0.5;
+    animation: pulse 2.2s ease-out infinite;
+  }
+  @keyframes pulse {
+    0% { transform: scale(1); opacity: 0.5; }
+    100% { transform: scale(3); opacity: 0; }
+  }
+  .drop-marker .box {
+    position: absolute; left: 50%; top: 50%;
+    width: 12px; height: 12px; margin: -6px 0 0 -6px;
+    border: 2px solid var(--ink); transform: rotate(45deg);
+    background: var(--surface);
+    box-shadow: 0 1px 3px rgba(31, 30, 26, 0.25);
+  }
+  .route-line { stroke-linecap: round; stroke-dasharray: 1 8; }
+
+  /* right column */
+  aside {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1.1fr) minmax(0, 1fr);
+    gap: 1rem;
+  }
+  aside > section { padding: 1rem 1.25rem; overflow: hidden; }
+
+  h2 {
+    font-size: 0.72rem; font-weight: 600; letter-spacing: 0.08em;
+    color: var(--muted); text-transform: uppercase;
+    margin-bottom: 0.7rem;
+  }
+  h2 .count { color: var(--green); }
+
+  /* timer */
+  #timer-block { text-align: center; padding: 1rem 1.25rem 1.2rem; }
+  #timer-block h2 { margin-bottom: 0.2rem; }
+  #timer {
+    font-size: clamp(3rem, 7vw, 5.5rem);
+    font-weight: 600; letter-spacing: -0.01em;
+    line-height: 1.05;
+    font-variant-numeric: tabular-nums;
+  }
+  #timer.critical { color: var(--red); }
+  #timer.sending {
+    font-size: clamp(1.6rem, 3.5vw, 2.4rem);
+    color: var(--green);
+    padding: 0.8rem 0;
+  }
+  #timer-sub { font-size: 0.82rem; color: var(--muted); margin-top: 0.25rem; }
+  #timer-sub b { color: var(--ink); font-weight: 600; }
+
+  /* deals */
+  .deal {
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 0.6rem 0.85rem; margin-bottom: 0.55rem;
+    display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.15rem 0.8rem; align-items: center;
+  }
+  .deal .store {
+    font-size: 0.68rem; font-weight: 600; letter-spacing: 0.07em;
+    color: var(--green); text-transform: uppercase;
+  }
+  .deal .title { font-size: 0.9rem; font-weight: 500; }
+  .deal .togo {
+    grid-row: span 2; font-size: 0.78rem; font-weight: 500;
+    color: var(--muted); text-align: right; white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .deal .togo.hit { color: var(--green); font-weight: 600; }
+  .deal .bar {
+    grid-column: 1 / -1; height: 4px; background: var(--paper);
+    border-radius: 999px; margin-top: 0.4rem; overflow: hidden;
+  }
+  .deal .bar i {
+    display: block; height: 100%; background: var(--green);
+    border-radius: 999px;
+    transition: width 0.6s ease;
+  }
+  .deal.unlocked { border-color: rgba(47, 93, 58, 0.4); background: var(--green-tint); }
+  .deal.unlocked .bar { background: rgba(47, 93, 58, 0.15); }
+  .empty { color: var(--faint); font-size: 0.85rem; padding: 0.4rem 0; }
+
+  /* roster */
+  #roster-rows {
+    overflow-y: auto; max-height: calc(100% - 1.6rem);
+    scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent;
+  }
+  .rider {
+    display: flex; align-items: baseline; gap: 0.8rem;
+    padding: 0.5rem 0; border-bottom: 1px solid var(--line);
+  }
+  .rider:last-child { border-bottom: none; }
+  .rider .who { font-weight: 600; font-size: 0.9rem; min-width: 5.2rem; }
+  .rider .what {
+    flex: 1; font-size: 0.82rem; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .rider .amt {
+    font-size: 0.85rem; font-weight: 600; color: var(--green);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ---------- ticker ---------- */
+  footer {
+    background: var(--surface);
+    border-top: 1px solid var(--line);
+    overflow: hidden; white-space: nowrap;
+    padding: 0.55rem 0; font-size: 0.8rem;
+  }
+  #ticker-inner { display: inline-block; padding-left: 1.5rem; }
+  #ticker-inner.scroll { padding-left: 0; animation: tick 50s linear infinite; }
+  #ticker-inner span.sep { color: var(--line-strong); margin: 0 1.1rem; }
+  #ticker-inner span.ev { color: var(--muted); }
+  #ticker-inner span.ev b { color: var(--ink); font-weight: 500; }
+  @keyframes tick { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <div class="brand">Grocery <em>Agent</em></div>
+    <div class="brand-sub">Group dispatch</div>
+  </div>
+  <span class="demo-tag" id="demo-tag">Demo data</span>
+  <div class="drop" id="drop">Drop: <b>…</b></div>
+  <div class="chip" id="status-chip"><span class="dot"></span><span id="status-text">Connecting</span></div>
+</header>
+
+<main>
+  <section class="card" id="map-panel">
+    <div id="map"></div>
+    <div id="driver-card">
+      <div class="label">Driver</div>
+      <div class="line" id="driver-line">Waiting for dispatch data…</div>
+    </div>
+  </section>
+
+  <aside>
+    <section class="card" id="timer-block">
+      <h2>Next order goes out in</h2>
+      <div id="timer">--<span class="colon">:</span>--</div>
+      <div id="timer-sub">&nbsp;</div>
+    </section>
+
+    <section class="card">
+      <h2>Deal board</h2>
+      <div id="deals"><div class="empty">No deals posted yet. POST /api/deals to add one.</div></div>
+    </section>
+
+    <section class="card">
+      <h2>On this order <span class="count" id="rider-count"></span></h2>
+      <div id="roster-rows"><div class="empty">Nobody has joined the batch yet.</div></div>
+    </section>
+  </aside>
+</main>
+
+<footer><div id="ticker-inner"><span class="ev">Connecting to dispatch…</span></div></footer>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const money = n => '$' + Number(n).toFixed(2);
+
+let map, driverMarker, dropMarker, routeLine, didFit = false;
+let nextFireAt = 0, clockSkew = 0;   // skew = clientNow - serverNow, seconds
+
+function initMap(drop) {
+  map = L.map('map', { zoomControl: false, attributionControl: true });
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; OpenStreetMap &copy; CARTO', maxZoom: 19,
+  }).addTo(map);
+  map.setView([drop.lat, drop.lng], 15);
+  dropMarker = L.marker([drop.lat, drop.lng], {
+    icon: L.divIcon({ className: 'drop-marker', html: '<div class="box"></div>', iconSize: [0, 0] }),
+  }).addTo(map);
+}
+
+function renderDriver(driver, drop) {
+  if (!map) initMap(drop);
+  if (!driver.active) {
+    $('driver-line').innerHTML = 'No driver out yet. The next run leaves when the timer hits zero.';
+    return;
+  }
+  const pos = [driver.lat, driver.lng];
+  if (!driverMarker) {
+    driverMarker = L.marker(pos, {
+      icon: L.divIcon({ className: 'drv-marker', html: '<div class="ring"></div><div class="core"></div>', iconSize: [0, 0] }),
+    }).addTo(map);
+  } else {
+    driverMarker.setLatLng(pos);
+  }
+  if (driver.route) {
+    if (!routeLine) {
+      routeLine = L.polyline(driver.route, {
+        color: '#2f5d3a', weight: 3, opacity: 0.65, className: 'route-line',
+      }).addTo(map);
+    } else {
+      routeLine.setLatLngs(driver.route);
+    }
+    if (!didFit) {
+      map.fitBounds(routeLine.getBounds().pad(0.18));
+      didFit = true;
+    }
+  }
+  const eta = driver.phase === 'AT DROP'
+    ? '<span class="eta">at the drop point</span>'
+    : `<span class="eta">ETA ${esc(driver.eta_min)} min</span>`;
+  $('driver-line').innerHTML =
+    `<b>${esc(driver.name)}</b> · ${esc(driver.phase.toLowerCase())} · ${eta}` +
+    (driver.store ? `<br><span style="color:var(--muted)">from ${esc(driver.store)}</span>` : '');
+}
+
+function renderDeals(deals, est) {
+  const box = $('deals');
+  if (!deals.length) {
+    box.innerHTML = '<div class="empty">No deals posted yet. POST /api/deals to add one.</div>';
+    return;
+  }
+  box.innerHTML = deals.map(d => {
+    let togo = '', bar = '', unlocked = '';
+    if (d.threshold && est != null) {
+      const pct = Math.min(100, est / d.threshold * 100);
+      const hit = est >= d.threshold;
+      unlocked = hit ? ' unlocked' : '';
+      togo = hit
+        ? '<div class="togo hit">Unlocked</div>'
+        : `<div class="togo">${money(d.threshold - est)}<br>to go</div>`;
+      bar = `<div class="bar"><i style="width:${pct}%"></i></div>`;
+    } else if (d.threshold) {
+      togo = `<div class="togo">min ${money(d.threshold)}</div>`;
+    }
+    return `<div class="deal${unlocked}">
+      <div class="store">${esc(d.store || 'Any store')}${d.posted_by ? ` · via ${esc(d.posted_by)}` : ''}</div>
+      ${togo}
+      <div class="title">${esc(d.title)}</div>
+      ${bar}</div>`;
+  }).join('');
+}
+
+function renderRoster(batch) {
+  const box = $('roster-rows');
+  $('rider-count').textContent = batch.length ? `· ${batch.length}` : '';
+  if (!batch.length) {
+    box.innerHTML = '<div class="empty">Nobody has joined the batch yet.</div>';
+    return;
+  }
+  box.innerHTML = batch.map(entry => {
+    const what = entry.items.map(it =>
+      (it.quantity !== 1 ? `${it.quantity}x ` : '') + it.name).join(' · ');
+    const est = entry.items.reduce((sum, it) =>
+      typeof it.est === 'number' ? sum + it.est * (it.quantity || 1) : sum, 0);
+    return `<div class="rider">
+      <div class="who">${esc(entry.person)}</div>
+      <div class="what">${esc(what)}</div>
+      ${est ? `<div class="amt">${money(est)}</div>` : ''}</div>`;
+  }).join('');
+}
+
+function renderTicker(events) {
+  if (!events.length) return;
+  const html = events.map(e => `<span class="ev">${esc(e.text)}</span>`).join('<span class="sep">·</span>');
+  // Two copies so the marquee loops seamlessly
+  $('ticker-inner').className = 'scroll';
+  $('ticker-inner').innerHTML = html + '<span class="sep">·</span>' + html + '<span class="sep">·</span>';
+}
+
+function renderStatus(driver) {
+  const chip = $('status-chip'), text = $('status-text');
+  if (driver.active && (driver.phase === 'EN ROUTE' || driver.phase === 'AT DROP')) {
+    chip.className = 'chip green';
+    text.textContent = driver.phase === 'AT DROP' ? 'Driver at drop' : 'Driver en route';
+  } else {
+    chip.className = 'chip';
+    text.textContent = 'Collecting orders';
+  }
+}
+
+function tickTimer() {
+  const el = $('timer');
+  if (!nextFireAt) return;
+  const serverNow = Date.now() / 1000 - clockSkew;
+  let remain = Math.round(nextFireAt - serverNow);
+  if (remain <= 0) {
+    el.className = 'sending';
+    el.textContent = 'Sending order…';
+    return;
+  }
+  el.className = remain < 60 ? 'critical' : '';
+  const h = Math.floor(remain / 3600), m = Math.floor((remain % 3600) / 60), s = remain % 60;
+  const pad = n => String(n).padStart(2, '0');
+  el.innerHTML = (h ? `${h}<span class="colon">:</span>${pad(m)}` : `${pad(m)}`) +
+    `<span class="colon">:</span>${pad(s)}`;
+}
+
+async function poll() {
+  try {
+    const r = await (await fetch('/api/dashboard')).json();
+    clockSkew = Date.now() / 1000 - r.now;
+    nextFireAt = r.next_fire_at;
+    $('demo-tag').style.display = r.demo ? 'inline-block' : 'none';
+    $('drop').innerHTML = `Drop: <b>${esc(r.drop_point.name)}</b>`;
+    const t = r.batch_totals;
+    $('timer-sub').innerHTML = t.people
+      ? `<b>${t.people}</b> riding · <b>${t.items}</b> items` +
+        (t.est_subtotal != null ? ` · est <b>${money(t.est_subtotal)}</b>` : '')
+      : 'Batch is empty. Text the agent to get on this run.';
+    renderDriver(r.driver, r.drop_point);
+    renderStatus(r.driver);
+    renderDeals(r.deals, r.batch_totals.est_subtotal);
+    renderRoster(r.batch);
+    renderTicker(r.events);
+  } catch (e) {
+    $('status-text').textContent = 'Reconnecting';
+  }
+}
+
+poll();
+setInterval(poll, 3000);
+setInterval(tickTimer, 250);
+</script>
+</body>
+</html>
