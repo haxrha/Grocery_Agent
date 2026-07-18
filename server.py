@@ -803,8 +803,32 @@ def harvest_group_members(chat_id):
     return added
 
 
-# In group chats Henry only answers when addressed ("henry 2 milk, eggs").
-GROUP_TRIGGER = re.compile(r"^\s*@?(?:hungry\s+)?henry\b[\s,:!.-]*", re.I)
+# In group chats Henry only answers when mentioned ("@henry 2 milk, eggs")
+# and "!henry" toggles him silent/awake for the whole chat.
+GROUP_TRIGGER = re.compile(r"@(?:hungry\s*)?henry\b[\s,:!.-]*", re.I)
+MUTE_TOGGLE = re.compile(r"^\s*!\s*(?:hungry\s*)?henry\b", re.I)
+
+
+def load_muted_chats():
+    chats = set()
+    try:
+        with open(os.path.join(BASE_DIR, ".muted_chats")) as f:
+            chats = {line.strip() for line in f if line.strip()}
+    except OSError:
+        pass
+    return chats
+
+
+def set_chat_muted(chat_id, muted):
+    chats = load_muted_chats()
+    if muted:
+        chats.add(str(chat_id))
+    else:
+        chats.discard(str(chat_id))
+    path = os.path.join(BASE_DIR, ".muted_chats")
+    with open(path, "w") as f:
+        f.write("".join(c + "\n" for c in sorted(chats)))
+    os.chmod(path, 0o600)
 
 
 def pending_key(chat_id, sender, is_group):
@@ -1424,11 +1448,15 @@ class Handler(BaseHTTPRequestHandler):
         sender_known = bool(sender) and (not authorized
                                          or normalize_phone(sender) in authorized)
 
+        raw_text = find_message_text(payload) or ""
+
         if is_group:
-            # Membership in a provisioned group chat IS the authorization.
+            mute_hit = bool(MUTE_TOGGLE.match(raw_text))
+            mention = GROUP_TRIGGER.search(raw_text)
+            # Membership in a provisioned group chat IS the authorization —
+            # but provisioning itself takes an @henry from an authorized user.
             if chat_id not in load_authorized_chats():
-                if sender_known:
-                    # An authorized user speaking in a new group provisions it.
+                if sender_known and (mention or mute_hit):
                     if authorize_chat(chat_id,
                                       f"provisioned by {batch_person(sender)}"):
                         added = harvest_group_members(chat_id)
@@ -1438,13 +1466,37 @@ class Handler(BaseHTTPRequestHandler):
                         threading.Thread(target=send_linq_message, args=(
                             chat_id,
                             "Hungry Henry here — this group can now order "
-                            "groceries. Start a message with \"henry\" + your "
-                            "list (e.g. \"henry 2 milk, eggs\") and I'll confirm "
-                            "before it joins the group run."), daemon=True).start()
+                            "groceries. Mention me with \"@henry\" + your list "
+                            "(e.g. \"@henry 2 milk, eggs\") and I'll confirm "
+                            "before it joins the group run. Send \"!henry\" "
+                            "any time to mute me, and \"!henry\" again to "
+                            "wake me up."), daemon=True).start()
                 else:
                     self.send_json(200, {"ok": True,
                                          "ignored": "group chat not provisioned"})
                     return
+            # "!henry" toggles Henry silent/awake for the whole chat.
+            if mute_hit:
+                muted = chat_id in load_muted_chats()
+                set_chat_muted(chat_id, not muted)
+                threading.Thread(target=send_read_receipt, args=(chat_id,),
+                                 daemon=True).start()
+                if muted:
+                    push_event("Henry unmuted in a group chat")
+                    threading.Thread(target=send_linq_message, args=(
+                        chat_id, "I'm back — mention @henry with a list "
+                        "whenever you're hungry."), daemon=True).start()
+                else:
+                    push_event("Henry muted in a group chat")
+                    threading.Thread(target=send_linq_message, args=(
+                        chat_id, "Going quiet — send !henry again when you "
+                        "want me back."), daemon=True).start()
+                self.send_json(200, {"ok": True, "muted": not muted})
+                return
+            if chat_id in load_muted_chats():
+                # Fully silent: no processing, no read receipts, no replies.
+                self.send_json(200, {"ok": True, "ignored": "henry is muted here"})
+                return
         else:
             if authorized and sender and normalize_phone(sender) not in authorized:
                 self.send_json(200, {"ok": True,
@@ -1456,28 +1508,26 @@ class Handler(BaseHTTPRequestHandler):
                 sys.stderr.write("warning: allowlist active but no sender field "
                                  "found in webhook payload — allowing\n")
 
-        if chat_id:
-            threading.Thread(target=send_read_receipt, args=(chat_id,),
-                             daemon=True).start()
-
         # Conversational path: a real chat we can reply into gets the
         # Claude-driven confirm loop; a YES joins the group batch.
-        raw_text = find_message_text(payload)
         is_native = bool(payload.get("items") or payload.get("text"))
         if not is_native and chat_id and raw_text:
             text = raw_text
             if is_group:
-                m = GROUP_TRIGGER.match(text)
                 with PENDING_LOCK:
                     has_pending = pending_key(chat_id, sender, True) in PENDING_ORDERS
-                if m:
-                    text = text[m.end():].strip() or text
+                if mention:
+                    text = (raw_text[:mention.start()]
+                            + raw_text[mention.end():]).strip() or raw_text
                 elif not has_pending:
-                    # Group banter not addressed to Henry (and no pending
-                    # order whose YES/NO this could be) stays untouched.
-                    self.send_json(200, {"ok": True, "marked_read": True,
+                    # Group banter without an @henry (and no pending order
+                    # whose YES/NO this could be) stays untouched — not
+                    # even marked read.
+                    self.send_json(200, {"ok": True, "marked_read": False,
                                          "ignored": "not addressed to henry"})
                     return
+            threading.Thread(target=send_read_receipt, args=(chat_id,),
+                             daemon=True).start()
             entry = {"received_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                      "chat_id": chat_id, "message": raw_text,
                      "group": is_group, "status": "interpreting", "result": None}
@@ -1491,9 +1541,14 @@ class Handler(BaseHTTPRequestHandler):
                                          "the group run"})
             return
 
+        marked = bool(chat_id and not is_group)
+        if marked:  # DMs are always marked read, even non-orders
+            threading.Thread(target=send_read_receipt, args=(chat_id,),
+                             daemon=True).start()
+
         body = extract_order_payload(payload)
         if body.get("text") and looks_like_chitchat(body["text"]):
-            self.send_json(200, {"ok": True, "marked_read": bool(chat_id),
+            self.send_json(200, {"ok": True, "marked_read": marked,
                                  "ignored": "message doesn't look like an order"})
             return
         for k in ("store_id", "store_name"):  # query params override payload
@@ -1501,7 +1556,7 @@ class Handler(BaseHTTPRequestHandler):
                 body[k] = params[k][0]
         items = normalize_items(body)
         if not items:
-            self.send_json(200, {"ok": True, "marked_read": bool(chat_id),
+            self.send_json(200, {"ok": True, "marked_read": marked,
                                  "ignored": "no order items found in message"})
             return
 

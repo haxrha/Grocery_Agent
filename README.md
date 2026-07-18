@@ -119,15 +119,19 @@ chat in `data.chat.id`; outgoing sends wrap as
 `{"message": {"parts": [{"type": "text", "value": ...}]}}`.
 
 Group chats: add the agent's number to an iMessage group, then any
-already-authorized user texts a "henry"-addressed message once — the
-chat self-provisions (`.authorized_chats`, gitignored), members are
+already-authorized user sends one "@henry" mention — the chat
+self-provisions (`.authorized_chats`, gitignored), members are
 harvested into `.authorized_users` via `GET /v3/chats/{id}` so they can
 also DM, and everyone in the group can order from then on. In groups
-the agent only reacts to messages starting with "henry" (or
-"@henry" / "hungry henry"); a bare YES/NO still works for a member
-with a pending confirmation. Each member has their own pending order;
-confirmations in the group are addressed "For iMessage …1234". Adding
-someone to the group in Messages is all it takes to onboard them.
+Henry is silent unless mentioned: only messages containing "@henry"
+(or "@hungry henry") get processed — everything else is ignored and
+not even marked read. A bare YES/NO still works for a member with a
+pending confirmation. "!henry" mutes Henry for the whole chat (no
+replies, no read receipts, mentions ignored; persists across restarts
+in `.muted_chats`) and "!henry" again wakes him. Each member has their
+own pending order; confirmations in the group are addressed
+"For iMessage …1234". Adding someone to the group in Messages is all
+it takes to onboard them.
 
 Security:
 
