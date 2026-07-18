@@ -11,6 +11,9 @@ Hungry Henry will also automatically find the best deal nearest to the batch ord
 Hungry Henry also makes reciepts for the bill which was split so users can upload it to their ramp accounts if needed :)
 
 
+You can also put henry in "waiting mode" and in the family group chat when you wanna add something to the family grocery list you can just @henry - and when someone is going to grab groceries - they can use the hungry henry website to see a updated grocery list! So no more keeping track of who wants what specific brand or amount of something. 
+
+
 
 Group DoorDash ordering with an iMessage front door: text your grocery
 list to the agent, confirm the resolved order over iMessage, and your
