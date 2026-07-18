@@ -98,6 +98,17 @@ live deliveries and their Python SDK): incoming text lives in
 chat in `data.chat.id`; outgoing sends wrap as
 `{"message": {"parts": [{"type": "text", "value": ...}]}}`.
 
+Group chats: add the agent's number to an iMessage group, then any
+already-authorized user texts a "henry"-addressed message once — the
+chat self-provisions (`.authorized_chats`, gitignored), members are
+harvested into `.authorized_users` via `GET /v3/chats/{id}` so they can
+also DM, and everyone in the group can order from then on. In groups
+the agent only reacts to messages starting with "henry" (or
+"@henry" / "hungry henry"); a bare YES/NO still works for a member
+with a pending confirmation. Each member has their own pending order;
+confirmations in the group are addressed "For iMessage …1234". Adding
+someone to the group in Messages is all it takes to onboard them.
+
 Security:
 
 - `.authorized_users` (gitignored): one phone number or iMessage email
@@ -105,6 +116,11 @@ Security:
   Read per request — edit without restarting. Empty/missing = allow all.
   If a payload hides the sender under an unknown field, the message is
   allowed with a stderr warning rather than locking real users out.
+- `.agent_number` (gitignored) pins the agent to its own Linq line: the
+  webhook subscription is created with `phone_numbers` scoping, and the
+  server additionally drops any message whose chat `owner_handle`
+  isn't that number — other lines on the Linq account (e.g. business
+  traffic) are never read, marked read, or replied to.
 - Webhook auth: secret path token (`.webhook_secret`, auto-generated)
   plus Standard-Webhooks signature verification when a signing secret
   is configured (`.linq_signing_secret` or `LINQ_SIGNING_SECRET`).

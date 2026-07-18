@@ -3,6 +3,8 @@
 .linq_api_token
 .claude_oauth_token
 .authorized_users
+.authorized_chats
+.agent_number
 .last_deliveries.jsonl
 state.json
 __pycache__/

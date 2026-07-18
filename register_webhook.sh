@@ -27,9 +27,13 @@ for s in subs:
   echo "deleted stale subscription $sid"
 done
 
+PHONES="[]"
+if [[ -f .agent_number ]]; then
+  PHONES="[\"$(cat .agent_number | tr -d ' \n')\"]"
+fi
 curl -s -X POST https://api.linqapp.com/v3/webhook-subscriptions \
   -H "Authorization: Bearer $API" -H "Content-Type: application/json" \
-  -d "{\"target_url\": \"$TARGET\", \"subscribed_events\": [\"message.received\"]}" |
+  -d "{\"target_url\": \"$TARGET\", \"subscribed_events\": [\"message.received\"], \"phone_numbers\": $PHONES}" |
 python3 -c "
 import json, sys
 s = json.load(sys.stdin)

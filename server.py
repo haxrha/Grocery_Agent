@@ -734,6 +734,86 @@ def load_authorized_users():
     return users
 
 
+def agent_line():
+    """The agent's own Linq phone number (normalized), from .agent_number."""
+    try:
+        with open(os.path.join(BASE_DIR, ".agent_number")) as f:
+            value = f.read().strip()
+        return normalize_phone(value) if value else None
+    except OSError:
+        return None
+
+
+def load_authorized_chats():
+    """Group chats whose members may all use the agent, one chat id per line."""
+    chats = set()
+    try:
+        with open(os.path.join(BASE_DIR, ".authorized_chats")) as f:
+            for line in f:
+                line = line.split("#")[0].strip()
+                if line:
+                    chats.add(line)
+    except OSError:
+        pass
+    return chats
+
+
+def authorize_chat(chat_id, note=""):
+    """Add a group chat to the allowlist. Returns True if newly added."""
+    if str(chat_id) in load_authorized_chats():
+        return False
+    path = os.path.join(BASE_DIR, ".authorized_chats")
+    with open(path, "a") as f:
+        f.write(f"{chat_id}" + (f"  # {note}" if note else "") + "\n")
+    os.chmod(path, 0o600)
+    return True
+
+
+def fetch_chat_handles(chat_id):
+    """Participant handles for a chat via GET /v3/chats/{id} (empty on failure)."""
+    token = linq_api_token()
+    if not token:
+        return []
+    req = urllib.request.Request(
+        f"https://api.linqapp.com/v3/chats/{urllib.parse.quote(str(chat_id))}",
+        headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        sys.stderr.write(f"chat lookup failed for {chat_id}: {e}\n")
+        return []
+    handles = data.get("handles") or (data.get("chat") or {}).get("handles") or []
+    return [str(h["handle"]) for h in handles
+            if isinstance(h, dict) and not h.get("is_me")
+            and str(h.get("handle") or "").strip()]
+
+
+def harvest_group_members(chat_id):
+    """Fold a group chat's members into .authorized_users so DMs work too."""
+    known = load_authorized_users()
+    added = [h for h in fetch_chat_handles(chat_id)
+             if normalize_phone(h) not in known]
+    if added:
+        path = os.path.join(BASE_DIR, ".authorized_users")
+        with open(path, "a") as f:
+            for handle in added:
+                f.write(f"{handle}  # auto: member of group {chat_id}\n")
+        os.chmod(path, 0o600)
+    return added
+
+
+# In group chats Henry only answers when addressed ("henry 2 milk, eggs").
+GROUP_TRIGGER = re.compile(r"^\s*@?(?:hungry\s+)?henry\b[\s,:!.-]*", re.I)
+
+
+def pending_key(chat_id, sender, is_group):
+    """Group chats track one pending order per member, DMs one per chat."""
+    if is_group and sender:
+        return f"{chat_id}|{normalize_phone(sender)}"
+    return str(chat_id)
+
+
 SENDER_KEYS = ("sender_handle", "from", "sender", "sender_number",
                "from_number", "phone_number", "phone", "handle", "address",
                "participant")
@@ -766,6 +846,22 @@ def batch_person(sender):
     """Roster-friendly label for an iMessage sender (masked number)."""
     digits = re.sub(r"\D", "", str(sender or ""))
     return f"iMessage …{digits[-4:]}" if len(digits) >= 4 else "iMessage friend"
+
+
+def find_chat_dict(obj, depth=0):
+    """The chat object ({id, is_group, ...}) in a webhook payload, if any."""
+    if depth > 6 or not isinstance(obj, dict):
+        return None
+    for k in ("chat", "conversation"):
+        v = obj.get(k)
+        if isinstance(v, dict) and str(v.get("id") or "").strip():
+            return v
+    for k in CONTAINER_KEYS:
+        if isinstance(obj.get(k), dict):
+            found = find_chat_dict(obj[k], depth + 1)
+            if found:
+                return found
+    return None
 
 
 CHAT_ID_KEYS = ("chat_id", "chatId", "conversation_id", "conversationId")
@@ -1000,14 +1096,15 @@ def compose_confirm_text(res, summary):
         return fallback
 
 
-def handle_conversation(chat_id, text, sender, params, entry):
+def handle_conversation(chat_id, text, sender, params, entry, is_group=False):
     """Background worker: interpret a text, reply, and manage the confirm loop."""
     try:
         now = time.time()
+        pkey = pending_key(chat_id, sender, is_group)
         with PENDING_LOCK:
-            pending = PENDING_ORDERS.get(chat_id)
+            pending = PENDING_ORDERS.get(pkey)
             if pending and now - pending["created"] > PENDING_TTL:
-                del PENDING_ORDERS[chat_id]
+                del PENDING_ORDERS[pkey]
                 pending = None
         try:
             intent = claude_interpret(text, pending["summary"] if pending else None)
@@ -1023,7 +1120,7 @@ def handle_conversation(chat_id, text, sender, params, entry):
                                     "items": pending["batch_items"],
                                     "chat_id": chat_id})
             with PENDING_LOCK:
-                PENDING_ORDERS.pop(chat_id, None)
+                PENDING_ORDERS.pop(pkey, None)
             if result.get("ok"):
                 est = approx_total(pending["resolved"])
                 ORDERS.appendleft({
@@ -1039,11 +1136,12 @@ def handle_conversation(chat_id, text, sender, params, entry):
                 entry["status"] = "done"
                 entry["result"] = {"ok": True, "joined_batch": True,
                                    "person": person, "est_total": round(est, 2)}
+                who = f"{person} is" if is_group else "You're"
                 send_linq_message(chat_id,
-                                  f"You're on the run — {len(pending['batch_items'])} "
+                                  f"{who} on the run — {len(pending['batch_items'])} "
                                   f"item(s), est ${est:.2f}. The group order goes out "
                                   f"{when} (pickup: {DROP_POINT['name']}). "
-                                  "I'll text you when it's sent.")
+                                  "I'll text here when it's sent.")
             else:
                 entry["status"] = "failed"
                 entry["result"] = result
@@ -1051,10 +1149,13 @@ def handle_conversation(chat_id, text, sender, params, entry):
                                   f"{result.get('error')}")
         elif kind == "cancel" and pending:
             with PENDING_LOCK:
-                PENDING_ORDERS.pop(chat_id, None)
+                PENDING_ORDERS.pop(pkey, None)
             entry["status"] = "cancelled"
-            send_linq_message(chat_id, "No problem — cancelled that order. "
-                              "Text me a new list anytime.")
+            person = batch_person(pending.get("sender") or sender)
+            send_linq_message(chat_id,
+                              (f"Cancelled {person}'s order. " if is_group
+                               else "No problem — cancelled that order. ")
+                              + "Text me a new list anytime.")
         elif kind == "order":
             items = normalize_items({"items": intent.get("items") or []}) \
                 or normalize_items({"text": message_to_order_text(text)})
@@ -1085,12 +1186,14 @@ def handle_conversation(chat_id, text, sender, params, entry):
                                for it in res["resolved"]]
             summary = summarize_resolved(res)
             confirm_msg = compose_confirm_text(res, summary)
+            if is_group:
+                confirm_msg = f"For {batch_person(sender)}:\n{confirm_msg}"
             with PENDING_LOCK:
-                PENDING_ORDERS[chat_id] = {**res, "items": items,
-                                           "batch_items": batch_items,
-                                           "sender": sender,
-                                           "created": time.time(),
-                                           "summary": summary}
+                PENDING_ORDERS[pkey] = {**res, "items": items,
+                                        "batch_items": batch_items,
+                                        "sender": sender,
+                                        "created": time.time(),
+                                        "summary": summary}
             sent = send_linq_message(chat_id, confirm_msg)
             push_event(f"{batch_person(sender)} texted an order, awaiting YES")
             entry["status"] = "awaiting_confirmation"
@@ -1306,17 +1409,53 @@ class Handler(BaseHTTPRequestHandler):
 
         authorized = load_authorized_users()
         sender = find_sender(payload)
-        if authorized and sender and normalize_phone(sender) not in authorized:
-            self.send_json(200, {"ok": True,
-                                 "ignored": "sender not an authorized user"})
-            return
-        if authorized and not sender:
-            # Unknown payload shape — let it through so real users aren't
-            # locked out, but flag it so the field name can be added.
-            sys.stderr.write("warning: allowlist active but no sender field "
-                             "found in webhook payload — allowing\n")
+        chat = find_chat_dict(payload)
+        chat_id = str(chat["id"]) if chat else find_chat_id(payload)
+        is_group = bool(chat and chat.get("is_group"))
 
-        chat_id = find_chat_id(payload)
+        # Guard: only handle messages on the agent's own Linq line. The
+        # account carries other lines (business traffic) — never touch those.
+        agent_number = agent_line()
+        owner = ((chat or {}).get("owner_handle") or {}).get("handle")
+        if agent_number and owner and normalize_phone(owner) != agent_number:
+            self.send_json(200, {"ok": True,
+                                 "ignored": "message is for a different line"})
+            return
+        sender_known = bool(sender) and (not authorized
+                                         or normalize_phone(sender) in authorized)
+
+        if is_group:
+            # Membership in a provisioned group chat IS the authorization.
+            if chat_id not in load_authorized_chats():
+                if sender_known:
+                    # An authorized user speaking in a new group provisions it.
+                    if authorize_chat(chat_id,
+                                      f"provisioned by {batch_person(sender)}"):
+                        added = harvest_group_members(chat_id)
+                        push_event(f"Group chat provisioned by {batch_person(sender)}"
+                                   + (f", {len(added)} members authorized"
+                                      if added else ""))
+                        threading.Thread(target=send_linq_message, args=(
+                            chat_id,
+                            "Hungry Henry here — this group can now order "
+                            "groceries. Start a message with \"henry\" + your "
+                            "list (e.g. \"henry 2 milk, eggs\") and I'll confirm "
+                            "before it joins the group run."), daemon=True).start()
+                else:
+                    self.send_json(200, {"ok": True,
+                                         "ignored": "group chat not provisioned"})
+                    return
+        else:
+            if authorized and sender and normalize_phone(sender) not in authorized:
+                self.send_json(200, {"ok": True,
+                                     "ignored": "sender not an authorized user"})
+                return
+            if authorized and not sender:
+                # Unknown payload shape — let it through so real users aren't
+                # locked out, but flag it so the field name can be added.
+                sys.stderr.write("warning: allowlist active but no sender field "
+                                 "found in webhook payload — allowing\n")
+
         if chat_id:
             threading.Thread(target=send_read_receipt, args=(chat_id,),
                              daemon=True).start()
@@ -1326,12 +1465,25 @@ class Handler(BaseHTTPRequestHandler):
         raw_text = find_message_text(payload)
         is_native = bool(payload.get("items") or payload.get("text"))
         if not is_native and chat_id and raw_text:
+            text = raw_text
+            if is_group:
+                m = GROUP_TRIGGER.match(text)
+                with PENDING_LOCK:
+                    has_pending = pending_key(chat_id, sender, True) in PENDING_ORDERS
+                if m:
+                    text = text[m.end():].strip() or text
+                elif not has_pending:
+                    # Group banter not addressed to Henry (and no pending
+                    # order whose YES/NO this could be) stays untouched.
+                    self.send_json(200, {"ok": True, "marked_read": True,
+                                         "ignored": "not addressed to henry"})
+                    return
             entry = {"received_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                      "chat_id": chat_id, "message": raw_text,
-                     "status": "interpreting", "result": None}
+                     "group": is_group, "status": "interpreting", "result": None}
             WEBHOOK_LOG.appendleft(entry)
             threading.Thread(target=handle_conversation,
-                             args=(chat_id, raw_text, sender, params, entry),
+                             args=(chat_id, text, sender, params, entry, is_group),
                              daemon=True).start()
             self.send_json(202, {"ok": True, "marked_read": True,
                                  "note": "interpreting message; any order will be "
