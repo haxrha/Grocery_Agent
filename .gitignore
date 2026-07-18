@@ -1,0 +1,7 @@
+.webhook_secret
+.linq_signing_secret
+.linq_api_token
+.claude_oauth_token
+.authorized_users
+.last_deliveries.jsonl
+__pycache__/

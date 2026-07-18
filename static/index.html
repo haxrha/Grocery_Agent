@@ -43,6 +43,11 @@
 
 <div id="result"></div>
 
+<h2 style="font-size:1.15rem; margin-top:2.5rem">📦 iMessage orders</h2>
+<p class="hint">Orders texted to your Linq number. Claude texts back the resolved
+DoorDash order; once the sender replies YES it lands in the cart and shows here.</p>
+<div id="orders" class="hint">Loading…</div>
+
 <script>
 const $ = id => document.getElementById(id);
 const storeIds = {};   // "name" -> store_id from /api/stores
@@ -60,6 +65,26 @@ function esc(s) {
   return String(s ?? '').replace(/[&<>"]/g, c =>
     ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 }
+
+async function refreshOrders() {
+  try {
+    const r = await (await fetch('/api/orders')).json();
+    const pend = (r.awaiting_confirmation || []).map(p =>
+      `<li>⏳ <strong>awaiting YES</strong> (${Math.round(p.age_seconds / 60)} min ago)<br>` +
+      `${esc(p.summary).replace(/\n/g, '<br>')}</li>`).join('');
+    const done = (r.orders || []).map(o => {
+      const items = (o.resolved || []).map(it =>
+        `${esc(it.quantity)}${it.unit ? ' ' + esc(it.unit) : '×'} ${esc(it.name)}`).join(', ');
+      return `<li>✅ ${esc((o.confirmed_at || '').replace('T', ' '))} — ` +
+        `<strong>${esc(o.store_name)}</strong>: ${items}` +
+        (o.notes ? ` <span class="warn">(${esc(o.notes)})</span>` : '') + `</li>`;
+    }).join('');
+    $('orders').innerHTML = (pend + done)
+      ? `<ul style="line-height:1.8">${pend}${done}</ul>` : 'No iMessage orders yet.';
+  } catch {}
+}
+refreshOrders();
+setInterval(refreshOrders, 8000);
 
 $('send').onclick = async () => {
   const text = $('items').value.trim();
