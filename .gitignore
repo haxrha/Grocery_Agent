@@ -4,4 +4,5 @@
 .claude_oauth_token
 .authorized_users
 .last_deliveries.jsonl
+state.json
 __pycache__/

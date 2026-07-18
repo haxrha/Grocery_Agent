@@ -1,0 +1,733 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#faf3ea">
+<title>Grocery Agent · Group Dispatch</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@600;700;800&family=Quicksand:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root {
+    --cream: #faf3ea;
+    --surface: #ffffff;
+    --ink: #2b2622;
+    --muted: #8f887e;
+    --faint: #b5aea3;
+    --line: #f0e7db;
+    --coral: #e87a55;
+    --coral-text: #c9603e;
+    --coral-tint: #fbeee7;
+    --mint: #86c89a;
+    --green-text: #3e8f5c;
+    --green-tint: #e9f4ec;
+    --red: #cf5540;
+    --btn: #221e1b;
+    --blue: #0a84ff;
+    --shadow: 0 2px 12px rgba(43, 38, 34, 0.06);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: var(--cream) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='320' height='320' viewBox='0 0 320 320'%3E%3Cg opacity='0.55'%3E%3Cg fill='none' stroke-linecap='round' stroke-width='3.5'%3E%3Cpath stroke='%23b9ddc2' d='M40 32v16M32 40h16'/%3E%3Cpath stroke='%23f2b8a2' d='M228 60q6-10 12 0t12 0'/%3E%3Cpath stroke='%23f4bfc8' d='M262 178v16M254 186h16'/%3E%3Cpath stroke='%23f3d09e' d='M92 300v16M84 308h16'/%3E%3Cpath stroke='%23b9ddc2' d='M56 246q6-10 12 0t12 0'/%3E%3Cpath stroke='%23f4bfc8' d='M296 118q6-10 12 0t12 0'/%3E%3C/g%3E%3Ccircle fill='%23f4bfc8' cx='150' cy='36' r='4'/%3E%3Ccircle fill='%23b9ddc2' cx='190' cy='214' r='4'/%3E%3Ccircle fill='%23f3d09e' cx='20' cy='152' r='3.5'/%3E%3Ccircle fill='%23f2b8a2' cx='250' cy='262' r='3.5'/%3E%3Cpath fill='%23f3d09e' d='M84 128c2.2 6.5 2.2 6.5 8.5 8.5-6.3 2-6.3 2-8.5 8.5-2.2-6.5-2.2-6.5-8.5-8.5 6.3-2 6.3-2 8.5-8.5z'/%3E%3Cpath fill='%23f2b8a2' d='M284 20c2.2 6.5 2.2 6.5 8.5 8.5-6.3 2-6.3 2-8.5 8.5-2.2-6.5-2.2-6.5-8.5-8.5 6.3-2 6.3-2 8.5-8.5z'/%3E%3Cpath fill='%23b9ddc2' d='M148 292c2.2 6.5 2.2 6.5 8.5 8.5-6.3 2-6.3 2-8.5 8.5-2.2-6.5-2.2-6.5-8.5-8.5 6.3-2 6.3-2 8.5-8.5z'/%3E%3C/g%3E%3C/svg%3E");
+    background-size: 340px;
+    color: var(--ink);
+    font-family: "Quicksand", sans-serif;
+    font-weight: 500;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    height: 100vh;
+    overflow: hidden;
+  }
+  ::selection { background: var(--coral-tint); }
+
+  /* ---------- header ---------- */
+  header {
+    display: flex; align-items: center; gap: 1.1rem;
+    padding: 0.6rem 1.4rem;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
+  }
+  .brand { display: flex; align-items: center; gap: 0.65rem; }
+  .brand img {
+    width: 40px; height: 40px; object-fit: contain;
+    transform: rotate(-6deg);
+    filter: drop-shadow(0 2px 3px rgba(43, 38, 34, 0.18));
+  }
+  .brand-name {
+    font-family: "Baloo 2", sans-serif; font-weight: 700;
+    font-size: 1.2rem; line-height: 1.1;
+  }
+  .brand-sub { color: var(--muted); font-size: 0.76rem; font-weight: 600; }
+  .drop { margin-left: auto; font-size: 0.85rem; color: var(--muted); font-weight: 600; }
+  .drop b { color: var(--ink); font-weight: 700; }
+  .chip {
+    display: flex; align-items: center; gap: 0.45rem;
+    font-size: 0.8rem; font-weight: 700; color: var(--muted);
+    padding: 0.34rem 0.85rem;
+    background: var(--cream);
+    border: 1px solid var(--line); border-radius: 999px;
+  }
+  .chip.green { color: var(--green-text); background: var(--green-tint); border-color: #cfe7d6; }
+  .chip .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: currentColor;
+    animation: breathe 2.4s ease-in-out infinite;
+  }
+  .demo-tag {
+    font-size: 0.68rem; font-weight: 700; letter-spacing: 0.06em;
+    color: #8a6d1f; text-transform: uppercase;
+    background: #fdf3dd; border: 1px solid #f3d9a4; border-radius: 999px;
+    padding: 0.24rem 0.65rem; display: none;
+  }
+  .order-link {
+    font-family: "Baloo 2", sans-serif; font-weight: 600; font-size: 0.9rem;
+    color: #fff; background: var(--btn);
+    border: 0; cursor: pointer;
+    text-decoration: none; white-space: nowrap;
+    padding: 0.5rem 1.15rem; border-radius: 999px;
+    transition: transform 0.12s ease, box-shadow 0.12s ease;
+  }
+  .order-link:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(43, 38, 34, 0.25); }
+  .order-link:focus-visible { outline: 3px solid var(--coral); outline-offset: 2px; }
+  @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+  /* ---------- main ---------- */
+  main {
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+    gap: 1rem; padding: 1rem;
+    min-height: 0;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line); border-radius: 20px;
+    box-shadow: var(--shadow);
+    min-height: 0;
+  }
+
+  /* map panel */
+  #map-panel { position: relative; overflow: hidden; }
+  #map { position: absolute; inset: 0; background: var(--cream); }
+  .leaflet-container { font: inherit; }
+  #driver-card {
+    position: absolute; left: 0.9rem; bottom: 0.9rem; z-index: 800;
+    display: flex; align-items: center; gap: 0.75rem;
+    background: var(--surface);
+    border: 1px solid var(--line); border-radius: 16px;
+    box-shadow: 0 4px 16px rgba(43, 38, 34, 0.12);
+    padding: 0.65rem 1rem 0.65rem 0.75rem;
+    max-width: 85%;
+  }
+  #driver-card .car { width: 54px; height: auto; flex: none; }
+  #driver-card .label {
+    font-size: 0.66rem; font-weight: 700; letter-spacing: 0.14em;
+    color: var(--muted); text-transform: uppercase; margin-bottom: 0.15rem;
+  }
+  #driver-card .line { font-size: 0.86rem; }
+  #driver-card .line b { font-weight: 700; }
+  #driver-card .line .eta { color: var(--green-text); font-weight: 700; }
+  .drv-marker { position: relative; }
+  .drv-marker .core {
+    position: absolute; left: 50%; top: 50%;
+    width: 13px; height: 13px; margin: -6.5px 0 0 -6.5px;
+    background: var(--coral); border: 2.5px solid #fff; border-radius: 50%;
+    box-shadow: 0 1px 4px rgba(43, 38, 34, 0.35);
+  }
+  .drv-marker .ring {
+    position: absolute; left: 50%; top: 50%;
+    width: 13px; height: 13px; margin: -6.5px 0 0 -6.5px;
+    border: 2px solid var(--coral); border-radius: 50%;
+    opacity: 0.5;
+    animation: pulse 2.2s ease-out infinite;
+  }
+  @keyframes pulse {
+    0% { transform: scale(1); opacity: 0.5; }
+    100% { transform: scale(3); opacity: 0; }
+  }
+  .drop-marker .box {
+    position: absolute; left: 50%; top: 50%;
+    width: 12px; height: 12px; margin: -6px 0 0 -6px;
+    border: 2.5px solid var(--ink); border-radius: 3px;
+    transform: rotate(45deg);
+    background: var(--surface);
+    box-shadow: 0 1px 3px rgba(43, 38, 34, 0.25);
+  }
+  .route-line { stroke-linecap: round; stroke-dasharray: 1 8; }
+
+  /* right column */
+  aside {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1.1fr) minmax(0, 1fr) auto;
+    gap: 1rem;
+  }
+  aside > section { padding: 0.9rem 1.2rem; overflow: hidden; }
+
+  h2 {
+    font-size: 0.7rem; font-weight: 700; letter-spacing: 0.14em;
+    color: var(--muted); text-transform: uppercase;
+    margin-bottom: 0.6rem;
+  }
+  h2 .count { color: var(--coral-text); }
+
+  /* timer */
+  #timer-block { text-align: center; padding: 0.9rem 1.2rem 1rem; }
+  #timer-block h2 { margin-bottom: 0.1rem; }
+  #timer {
+    font-family: "Baloo 2", sans-serif;
+    font-size: clamp(2.8rem, 6.5vw, 5rem);
+    font-weight: 800; line-height: 1.1;
+    font-variant-numeric: tabular-nums;
+  }
+  #timer.critical { color: var(--red); }
+  #timer.sending {
+    font-size: clamp(1.5rem, 3.2vw, 2.2rem);
+    color: var(--green-text);
+    padding: 0.7rem 0;
+  }
+  #timer-sub { font-size: 0.82rem; color: var(--muted); font-weight: 600; margin-top: 0.1rem; }
+  #timer-sub b { color: var(--ink); font-weight: 700; }
+
+  /* deals */
+  .deal {
+    border: 1px solid var(--line); border-radius: 14px;
+    padding: 0.55rem 0.85rem; margin-bottom: 0.5rem;
+    display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.12rem 0.8rem; align-items: center;
+  }
+  .deal .store {
+    font-size: 0.66rem; font-weight: 700; letter-spacing: 0.1em;
+    color: var(--coral-text); text-transform: uppercase;
+  }
+  .deal .title { font-size: 0.9rem; font-weight: 600; }
+  .deal .togo {
+    grid-row: span 2; font-size: 0.78rem; font-weight: 600;
+    color: var(--muted); text-align: right; white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .deal .togo.hit { color: var(--green-text); font-weight: 700; }
+  .deal .bar {
+    grid-column: 1 / -1; height: 5px; background: var(--cream);
+    border-radius: 999px; margin-top: 0.4rem; overflow: hidden;
+  }
+  .deal .bar i {
+    display: block; height: 100%; background: var(--mint);
+    border-radius: 999px;
+    transition: width 0.6s ease;
+  }
+  .deal.unlocked { border-color: #cfe7d6; background: var(--green-tint); }
+  .deal.unlocked .bar { background: rgba(62, 143, 92, 0.15); }
+  .empty { color: var(--faint); font-size: 0.85rem; padding: 0.35rem 0; }
+
+  /* roster */
+  #roster-rows {
+    overflow-y: auto; max-height: calc(100% - 1.5rem);
+    scrollbar-width: thin; scrollbar-color: var(--line) transparent;
+  }
+  .rider {
+    display: flex; align-items: baseline; gap: 0.8rem;
+    padding: 0.45rem 0; border-bottom: 1px solid var(--line);
+  }
+  .rider:last-child { border-bottom: none; }
+  .rider .who { font-weight: 700; font-size: 0.9rem; min-width: 5.2rem; }
+  .rider .what {
+    flex: 1; font-size: 0.82rem; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .rider .amt {
+    font-size: 0.85rem; font-weight: 700; color: var(--green-text);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* join by text */
+  #text-block { display: flex; align-items: center; gap: 1rem; padding: 0.9rem 1.2rem; }
+  #text-block .bubbles { flex: none; display: grid; gap: 0.3rem; max-width: 46%; }
+  .bubble {
+    padding: 0.45rem 0.75rem; border-radius: 15px;
+    font-size: 0.82rem; line-height: 1.35; font-weight: 600;
+  }
+  .bubble.me {
+    justify-self: end;
+    color: #fff; background: var(--blue);
+    border-bottom-right-radius: 5px;
+  }
+  .bubble.them {
+    justify-self: start;
+    color: var(--ink); background: #efece4;
+    border-bottom-left-radius: 5px;
+  }
+  #text-block .copy { font-size: 0.85rem; color: var(--muted); font-weight: 600; }
+  #text-block .copy b { color: var(--ink); font-weight: 700; }
+  #text-block .copy h2 { margin-bottom: 0.25rem; }
+
+  /* ---------- order modal ---------- */
+  #order-overlay {
+    position: fixed; inset: 0; z-index: 2000;
+    background: rgba(43, 38, 34, 0.45);
+    display: none; align-items: flex-start; justify-content: center;
+    padding: 4rem 1rem 2rem; overflow-y: auto;
+  }
+  #order-overlay.open { display: flex; }
+  #order-modal {
+    position: relative;
+    width: min(540px, 100%);
+    background: var(--surface); border-radius: 24px;
+    box-shadow: 0 20px 60px rgba(43, 38, 34, 0.3);
+    padding: 1.4rem 1.5rem 1.5rem;
+  }
+  #order-modal h3 {
+    font-family: "Baloo 2", sans-serif; font-weight: 700; font-size: 1.35rem;
+    line-height: 1.2; padding-right: 2.5rem;
+  }
+  #order-modal .sub { color: var(--muted); font-size: 0.85rem; font-weight: 600; margin-bottom: 1.1rem; }
+  #order-close {
+    position: absolute; top: 1.1rem; right: 1.1rem;
+    width: 34px; height: 34px; border-radius: 50%;
+    border: 1px solid var(--line); background: var(--cream);
+    color: var(--muted); font-size: 1rem; font-weight: 700;
+    cursor: pointer; line-height: 1;
+    transition: background 0.12s ease, color 0.12s ease;
+  }
+  #order-close:hover { background: var(--line); color: var(--ink); }
+  #order-modal label {
+    display: block;
+    font-size: 0.7rem; font-weight: 700; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--muted);
+    margin: 1rem 0 0.45rem;
+  }
+  #order-modal label:first-of-type { margin-top: 0; }
+  #order-modal label .opt { color: var(--faint); letter-spacing: 0.08em; }
+  #order-modal textarea, #order-modal input {
+    font: inherit; font-weight: 500; font-size: 0.95rem; width: 100%; color: var(--ink);
+    padding: 0.65rem 0.85rem;
+    background: var(--surface);
+    border: 1.5px solid var(--line); border-radius: 14px;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  #order-modal textarea::placeholder, #order-modal input::placeholder { color: var(--faint); }
+  #order-modal textarea:focus, #order-modal input:focus {
+    outline: none; border-color: var(--coral);
+    box-shadow: 0 0 0 4px var(--coral-tint);
+  }
+  #order-modal textarea { min-height: 8.5rem; resize: vertical; }
+  #order-modal .hint { color: var(--muted); font-size: 0.8rem; font-weight: 500; margin-top: 0.4rem; }
+  #order-modal .hint code, #result code {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 0.82em; background: var(--cream);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 0.06rem 0.3rem;
+  }
+  #send {
+    appearance: none;
+    font-family: "Baloo 2", sans-serif; font-weight: 600; font-size: 1.05rem;
+    color: #fff; background: var(--btn);
+    border: 0; border-radius: 999px;
+    width: 100%; padding: 0.85rem 1.5rem; margin-top: 1.2rem;
+    cursor: pointer;
+    transition: transform 0.12s ease, box-shadow 0.12s ease, opacity 0.15s ease;
+  }
+  #send:hover { transform: translateY(-1px); box-shadow: 0 5px 16px rgba(43, 38, 34, 0.25); }
+  #send:active { transform: translateY(1px); box-shadow: none; }
+  #send:focus-visible { outline: 3px solid var(--coral); outline-offset: 3px; }
+  #send:disabled { opacity: 0.55; cursor: progress; transform: none; box-shadow: none; }
+  #result {
+    margin-top: 1.1rem; padding: 1rem 1.1rem; display: none;
+    border: 1.5px solid var(--line); border-radius: 16px;
+    overflow-x: auto; font-size: 0.88rem;
+    max-height: 40vh; overflow-y: auto;
+  }
+  #result.ok { border-color: #a4d5b3; }
+  #result.err { border-color: #eba795; background: #fbece8; }
+  #result .headline { font-family: "Baloo 2", sans-serif; font-weight: 700; font-size: 1rem; color: var(--green-text); }
+  #result table { border-collapse: collapse; width: 100%; margin-top: 0.6rem; }
+  #result th {
+    text-align: left; font-size: 0.64rem; font-weight: 700;
+    letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted);
+    padding: 0 0.8rem 0.35rem 0; border-bottom: 1.5px solid var(--line);
+  }
+  #result td { text-align: left; padding: 0.35rem 0.8rem 0.35rem 0; border-bottom: 1px solid var(--line); }
+  #result tr:last-child td { border-bottom: none; }
+  #result td.num { font-variant-numeric: tabular-nums; white-space: nowrap; font-weight: 600; }
+  #result .warn { color: var(--coral-text); font-weight: 600; }
+  #result .error { color: var(--red); font-weight: 600; }
+  #result ul { margin: 0.3rem 0 0 1.2rem; }
+
+  /* ---------- ticker ---------- */
+  footer {
+    background: var(--surface);
+    border-top: 1px solid var(--line);
+    overflow: hidden; white-space: nowrap;
+    padding: 0.5rem 0; font-size: 0.8rem; font-weight: 600;
+  }
+  #ticker-inner { display: inline-block; padding-left: 1.5rem; }
+  #ticker-inner.scroll { padding-left: 0; animation: tick 50s linear infinite; }
+  #ticker-inner span.sep { color: var(--faint); margin: 0 1.1rem; }
+  #ticker-inner span.ev { color: var(--muted); }
+  #ticker-inner span.ev b { color: var(--ink); font-weight: 700; }
+  @keyframes tick { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+
+  /* ---------- small screens ---------- */
+  @media (max-width: 900px) {
+    body { height: auto; overflow: auto; }
+    main { grid-template-columns: 1fr; }
+    #map-panel { height: 46vh; min-height: 300px; }
+    aside { grid-template-rows: none; }
+    aside > section { overflow: visible; }
+    #roster-rows { max-height: none; }
+    .drop { display: none; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .chip .dot, .drv-marker .ring { animation: none; }
+    #ticker-inner.scroll { animation: none; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <img src="/assets/grocery-bag.webp" alt="">
+    <div>
+      <div class="brand-name">Grocery Agent</div>
+      <div class="brand-sub">Group dispatch</div>
+    </div>
+  </div>
+  <span class="demo-tag" id="demo-tag">Demo data</span>
+  <div class="drop" id="drop">Drop: <b>…</b></div>
+  <div class="chip" id="status-chip"><span class="dot"></span><span id="status-text">Connecting</span></div>
+  <button class="order-link" id="order-open" type="button">Order online →</button>
+</header>
+
+<main>
+  <section class="card" id="map-panel">
+    <div id="map"></div>
+    <div id="driver-card">
+      <img class="car" src="/assets/delivery-car-loaded.webp" alt="">
+      <div>
+        <div class="label">Driver</div>
+        <div class="line" id="driver-line">Waiting for dispatch data…</div>
+      </div>
+    </div>
+  </section>
+
+  <aside>
+    <section class="card" id="timer-block">
+      <h2>Next order goes out in</h2>
+      <div id="timer">--:--</div>
+      <div id="timer-sub">&nbsp;</div>
+    </section>
+
+    <section class="card">
+      <h2>Deal board</h2>
+      <div id="deals"><div class="empty">No deals posted yet. POST /api/deals to add one.</div></div>
+    </section>
+
+    <section class="card">
+      <h2>On this order <span class="count" id="rider-count"></span></h2>
+      <div id="roster-rows"><div class="empty">Nobody has joined the batch yet.</div></div>
+      <div id="imessage-awaiting"></div>
+    </section>
+
+    <section class="card" id="text-block">
+      <div class="bubbles" aria-hidden="true">
+        <div class="bubble me">2 milk, eggs, bread</div>
+        <div class="bubble them">Added to the run 🛒</div>
+      </div>
+      <div class="copy">
+        <h2>Join by text</h2>
+        Text your list to <b>Grocery Agent</b> in iMessage — your items hop on
+        the next group run automatically.
+      </div>
+    </section>
+  </aside>
+</main>
+
+<footer><div id="ticker-inner"><span class="ev">Connecting to dispatch…</span></div></footer>
+
+<div id="order-overlay">
+  <div id="order-modal" role="dialog" aria-modal="true" aria-labelledby="order-title">
+    <h3 id="order-title">Place a bulk order</h3>
+    <p class="sub">Everything gets added straight to the DoorDash cart.</p>
+    <button id="order-close" type="button" aria-label="Close">✕</button>
+
+    <label for="items">Your list</label>
+    <textarea id="items" placeholder="2 milk&#10;eggs&#10;bread&#10;bananas x3"></textarea>
+    <p class="hint">One item per line — <code>2 milk</code>, <code>milk x2</code>, or <code>0.5 ground beef</code> (lb for weight items).</p>
+
+    <label for="store">Store <span class="opt">(optional)</span></label>
+    <input id="store" list="stores" placeholder="Leave blank to auto-pick, or type e.g. Whole Foods">
+    <datalist id="stores"></datalist>
+    <p class="hint" id="store-hint">Loading nearby stores…</p>
+
+    <button id="send" type="button">Send order to cart</button>
+
+    <div id="result" aria-live="polite"></div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const money = n => '$' + Number(n).toFixed(2);
+
+let map, driverMarker, dropMarker, routeLine, didFit = false;
+let nextFireAt = 0, clockSkew = 0;   // skew = clientNow - serverNow, seconds
+
+function initMap(drop) {
+  map = L.map('map', { zoomControl: false, attributionControl: true });
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; OpenStreetMap &copy; CARTO', maxZoom: 19,
+  }).addTo(map);
+  map.setView([drop.lat, drop.lng], 15);
+  dropMarker = L.marker([drop.lat, drop.lng], {
+    icon: L.divIcon({ className: 'drop-marker', html: '<div class="box"></div>', iconSize: [0, 0] }),
+  }).addTo(map);
+}
+
+function renderDriver(driver, drop) {
+  if (!map) initMap(drop);
+  if (!driver.active) {
+    $('driver-line').innerHTML = 'No driver out yet. The next run leaves when the timer hits zero.';
+    return;
+  }
+  const pos = [driver.lat, driver.lng];
+  if (!driverMarker) {
+    driverMarker = L.marker(pos, {
+      icon: L.divIcon({ className: 'drv-marker', html: '<div class="ring"></div><div class="core"></div>', iconSize: [0, 0] }),
+    }).addTo(map);
+  } else {
+    driverMarker.setLatLng(pos);
+  }
+  if (driver.route) {
+    if (!routeLine) {
+      routeLine = L.polyline(driver.route, {
+        color: '#e87a55', weight: 3, opacity: 0.7, className: 'route-line',
+      }).addTo(map);
+    } else {
+      routeLine.setLatLngs(driver.route);
+    }
+    if (!didFit) {
+      map.fitBounds(routeLine.getBounds().pad(0.18));
+      didFit = true;
+    }
+  }
+  const eta = driver.phase === 'AT DROP'
+    ? '<span class="eta">at the drop point</span>'
+    : `<span class="eta">ETA ${esc(driver.eta_min)} min</span>`;
+  $('driver-line').innerHTML =
+    `<b>${esc(driver.name)}</b> · ${esc(driver.phase.toLowerCase())} · ${eta}` +
+    (driver.store ? `<br><span style="color:var(--muted)">from ${esc(driver.store)}</span>` : '');
+}
+
+function renderDeals(deals, est) {
+  const box = $('deals');
+  if (!deals.length) {
+    box.innerHTML = '<div class="empty">No deals posted yet. POST /api/deals to add one.</div>';
+    return;
+  }
+  box.innerHTML = deals.map(d => {
+    let togo = '', bar = '', unlocked = '';
+    if (d.threshold && est != null) {
+      const pct = Math.min(100, est / d.threshold * 100);
+      const hit = est >= d.threshold;
+      unlocked = hit ? ' unlocked' : '';
+      togo = hit
+        ? '<div class="togo hit">Unlocked</div>'
+        : `<div class="togo">${money(d.threshold - est)}<br>to go</div>`;
+      bar = `<div class="bar"><i style="width:${pct}%"></i></div>`;
+    } else if (d.threshold) {
+      togo = `<div class="togo">min ${money(d.threshold)}</div>`;
+    }
+    return `<div class="deal${unlocked}">
+      <div class="store">${esc(d.store || 'Any store')}${d.posted_by ? ` · via ${esc(d.posted_by)}` : ''}</div>
+      ${togo}
+      <div class="title">${esc(d.title)}</div>
+      ${bar}</div>`;
+  }).join('');
+}
+
+function renderRoster(batch) {
+  const box = $('roster-rows');
+  $('rider-count').textContent = batch.length ? `· ${batch.length}` : '';
+  if (!batch.length) {
+    box.innerHTML = '<div class="empty">Nobody has joined the batch yet. Text your list to hop on.</div>';
+    return;
+  }
+  box.innerHTML = batch.map(entry => {
+    const what = entry.items.map(it =>
+      (it.quantity !== 1 ? `${it.quantity}x ` : '') + it.name).join(' · ');
+    const est = entry.items.reduce((sum, it) =>
+      typeof it.est === 'number' ? sum + it.est * (it.quantity || 1) : sum, 0);
+    return `<div class="rider">
+      <div class="who">${esc(entry.person)}</div>
+      <div class="what">${esc(what)}</div>
+      ${est ? `<div class="amt">${money(est)}</div>` : ''}</div>`;
+  }).join('');
+}
+
+function renderIMessage(im) {
+  const box = $('imessage-awaiting');
+  const awaiting = (im && im.awaiting) || [];
+  if (!awaiting.length) { box.innerHTML = ''; return; }
+  box.innerHTML = awaiting.map(p => {
+    const mins = Math.max(1, Math.round(p.age_seconds / 60));
+    const items = p.summary.split('\n').slice(1).map(l =>
+      l.replace(/^-\s*/, '')).join(' · ');
+    return `<div class="rider" style="opacity:.55">
+      <div class="who">${esc(p.person)}</div>
+      <div class="what">⏳ awaiting YES (${mins}m) — ${esc(items)}</div></div>`;
+  }).join('');
+}
+
+function renderTicker(events) {
+  if (!events.length) {
+    if (!$('ticker-inner').classList.contains('scroll'))
+      $('ticker-inner').innerHTML = '<span class="ev">No dispatch events yet — the ticker starts with the first run.</span>';
+    return;
+  }
+  const html = events.map(e => `<span class="ev">${esc(e.text)}</span>`).join('<span class="sep">·</span>');
+  // Two copies so the marquee loops seamlessly
+  $('ticker-inner').className = 'scroll';
+  $('ticker-inner').innerHTML = html + '<span class="sep">·</span>' + html + '<span class="sep">·</span>';
+}
+
+function renderStatus(driver) {
+  const chip = $('status-chip'), text = $('status-text');
+  if (driver.active && (driver.phase === 'EN ROUTE' || driver.phase === 'AT DROP')) {
+    chip.className = 'chip green';
+    text.textContent = driver.phase === 'AT DROP' ? 'Driver at drop' : 'Driver en route';
+  } else {
+    chip.className = 'chip';
+    text.textContent = 'Collecting orders';
+  }
+}
+
+function tickTimer() {
+  const el = $('timer');
+  if (!nextFireAt) return;
+  const serverNow = Date.now() / 1000 - clockSkew;
+  let remain = Math.round(nextFireAt - serverNow);
+  if (remain <= 0) {
+    el.className = 'sending';
+    el.textContent = 'Sending order…';
+    return;
+  }
+  el.className = remain < 60 ? 'critical' : '';
+  const h = Math.floor(remain / 3600), m = Math.floor((remain % 3600) / 60), s = remain % 60;
+  const pad = n => String(n).padStart(2, '0');
+  el.textContent = (h ? `${h}:${pad(m)}` : `${pad(m)}`) + `:${pad(s)}`;
+}
+
+async function poll() {
+  try {
+    const r = await (await fetch('/api/dashboard')).json();
+    clockSkew = Date.now() / 1000 - r.now;
+    nextFireAt = r.next_fire_at;
+    $('demo-tag').style.display = r.demo ? 'inline-block' : 'none';
+    $('drop').innerHTML = `Drop: <b>${esc(r.drop_point.name)}</b>`;
+    const t = r.batch_totals;
+    $('timer-sub').innerHTML = t.people
+      ? `<b>${t.people}</b> riding · <b>${t.items}</b> items` +
+        (t.est_subtotal != null ? ` · est <b>${money(t.est_subtotal)}</b>` : '')
+      : 'Batch is empty. Text the agent to get on this run.';
+    renderDriver(r.driver, r.drop_point);
+    renderStatus(r.driver);
+    renderDeals(r.deals, r.batch_totals.est_subtotal);
+    renderRoster(r.batch);
+    renderIMessage(r.imessage);
+    renderTicker(r.events);
+  } catch (e) {
+    $('status-text').textContent = 'Reconnecting';
+  }
+}
+
+poll();
+setInterval(poll, 3000);
+setInterval(tickTimer, 250);
+
+/* ---------- order modal ---------- */
+const overlay = $('order-overlay');
+const openOrder = () => { overlay.classList.add('open'); $('items').focus(); };
+const closeOrder = () => overlay.classList.remove('open');
+$('order-open').onclick = openOrder;
+$('order-close').onclick = closeOrder;
+overlay.addEventListener('click', e => { if (e.target === overlay) closeOrder(); });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && overlay.classList.contains('open')) closeOrder();
+});
+
+const storeIds = {};   // "name" -> store_id from /api/stores
+
+fetch('/api/stores').then(r => r.json()).then(data => {
+  const stores = data.stores || [];
+  $('stores').innerHTML = stores.map(s => `<option value="${esc(s.name)}">`).join('');
+  stores.forEach(s => storeIds[s.name] = s.store_id);
+  $('store-hint').textContent = stores.length
+    ? `${stores.length} stores near your default address.`
+    : 'Could not load nearby stores — you can still type a store name.';
+}).catch(() => $('store-hint').textContent = 'Could not load nearby stores.');
+
+$('send').onclick = async () => {
+  const text = $('items').value.trim();
+  const box = $('result');
+  if (!text) {
+    box.style.display = 'block';
+    box.className = 'err';
+    box.textContent = 'Add at least one item to get started.';
+    $('items').focus();
+    return;
+  }
+
+  const body = { text };
+  const store = $('store').value.trim();
+  if (store && storeIds[store]) body.store_id = String(storeIds[store]);
+  else if (store) body.store_name = store;
+
+  $('send').disabled = true;
+  box.style.display = 'block';
+  box.className = '';
+  box.textContent = 'Resolving items and filling the cart… this can take a minute.';
+
+  try {
+    const resp = await fetch('/api/order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const r = await resp.json();
+    box.className = r.ok ? 'ok' : 'err';
+    if (!r.ok) {
+      box.innerHTML = `<strong class="error">Order failed:</strong> ${esc(r.error)}`;
+      return;
+    }
+    const rows = (r.resolved || []).map(it =>
+      `<tr><td class="num">${esc(it.quantity)}${it.unit ? ' ' + esc(it.unit) : '×'}</td>` +
+      `<td>${esc(it.name)}</td><td class="num">${it.price != null ? '$' + esc(it.price) : ''}</td></tr>`
+    ).join('');
+    const errs = (r.item_errors || []).map(e =>
+      `<li class="error">${esc(e.item_name || e.item_id)}: ${esc(e.error_message)}</li>`).join('');
+    box.innerHTML =
+      `<span class="headline">Added to the ${esc(r.store_name)} cart</span>` +
+      (r.appended_to_existing_cart
+        ? ' <span class="warn">(appended to an existing cart at this store)</span>' : '') +
+      `<table><tr><th>Qty</th><th>Item</th><th>Price</th></tr>${rows}</table>` +
+      (r.notes ? `<p class="warn" style="margin-top:0.6rem">${esc(r.notes)}</p>` : '') +
+      (errs ? `<p class="error" style="margin-top:0.6rem">Some items failed:</p><ul>${errs}</ul>` : '') +
+      `<p class="hint" style="margin-top:0.8rem">Cart: <code>${esc(r.cart_uuid)}</code> · delivering to ${esc(r.delivery_address)}<br>` +
+      `Review &amp; check out in the DoorDash app, or run ` +
+      `<code>dd-cli order preview --cart-uuid ${esc(r.cart_uuid)}</code>.</p>`;
+  } catch (e) {
+    box.className = 'err';
+    box.textContent = 'Request failed: ' + e;
+  } finally {
+    $('send').disabled = false;
+  }
+};
+</script>
+</body>
+</html>

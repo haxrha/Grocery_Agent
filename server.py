@@ -1,17 +1,32 @@
 #!/usr/bin/env python3
-"""Bridge a basic web form to the DoorDash CLI.
+"""Grocery Agent: group DoorDash ordering with an iMessage front door.
 
-Serves static/index.html and exposes a JSON API:
+Serves static/dashboard.html and exposes a JSON API:
 
   GET  /api/stores          nearby grocery stores (for the store picker)
   GET  /api/carts           the consumer's open carts
   POST /api/order           resolve a bulk item list and add it all to the cart
 
-POST /api/order body (either shape):
-  {"text": "2 milk\neggs\nbread x3", "store_name": "Whole Foods"}
-  {"items": [{"name": "milk", "quantity": 2}, ...], "store_id": "1741590"}
+Group-order dispatch (backs /dashboard):
 
-Run: python3 server.py [port]   (default 8765, binds 127.0.0.1 only)
+  GET  /api/dashboard       full dispatch state: batch, deals, timer, driver
+  POST /api/batch/join      {"person": "Sarah", "text": "2 milk\neggs"} queue items
+  POST /api/deals           {"store", "title", "threshold"} post a deal
+  POST /api/timer           {"minutes": 20} move the next send time
+
+Linq iMessage agent:
+
+  POST /webhook/linq/<token>  Linq message.received webhook. Claude interprets
+                              the text, replies with the resolved order for
+                              confirmation, and a YES joins the group batch.
+  GET  /api/orders            confirmed iMessage orders + pending confirmations
+  GET  /api/webhook-log       recent webhook deliveries and their outcomes
+
+The batch fires automatically when the timer hits zero (BATCH_MINUTES env,
+default 30). DEMO=1 seeds sample data and animates a driver on the map.
+
+Run: python3 server.py [port]   (default 8765, binds 127.0.0.1 only;
+use start.sh for the public Cloudflare tunnel + webhook URL)
 """
 
 import base64
@@ -19,6 +34,7 @@ import collections
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
 import re
 import secrets
@@ -33,7 +49,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+STATE_PATH = os.path.join(BASE_DIR, "state.json")
 DD_TIMEOUT = 180
+
+# Group-order dispatch config
+BATCH_MINUTES = float(os.environ.get("BATCH_MINUTES", "30"))
+DEMO = os.environ.get("DEMO", "") not in ("", "0")
+DROP_POINT = {
+    "name": os.environ.get("DROP_NAME", "John Jay Lobby, Columbia"),
+    "lat": float(os.environ.get("DROP_LAT", "40.8062")),
+    "lng": float(os.environ.get("DROP_LNG", "-73.9631")),
+}
 
 
 def load_or_create_token():
@@ -61,7 +87,7 @@ SEEN_LOCK = threading.Lock()
 PENDING_ORDERS = {}
 PENDING_LOCK = threading.Lock()
 PENDING_TTL = 3600  # a pending confirmation goes stale after an hour
-ORDERS = collections.deque(maxlen=100)  # confirmed orders, shown in the web UI
+ORDERS = collections.deque(maxlen=100)  # confirmed iMessage orders
 
 
 class DDError(Exception):
@@ -298,7 +324,332 @@ def place_bulk_order(body):
                           f"First store said: {first_error}"}
 
 
-# --- Linq webhook support ---------------------------------------------------
+# --- Group-order dispatch state ---------------------------------------------
+
+STATE_LOCK = threading.Lock()
+STATE = {
+    "next_fire_at": 0.0,
+    "batch": [],       # [{person, items: [{name, quantity, est?}], joined_at, chat_id?}]
+    "deals": [],       # [{store, title, threshold, posted_by}]
+    "events": [],      # [{at, text}] newest first
+    "last_order": None,
+}
+
+DURABLE_KEYS = ("next_fire_at", "batch", "deals", "events", "last_order")
+
+
+def load_state():
+    if DEMO:
+        return
+    try:
+        with open(STATE_PATH) as f:
+            saved = json.load(f)
+        for key in DURABLE_KEYS:
+            if key in saved:
+                STATE[key] = saved[key]
+    except (OSError, json.JSONDecodeError):
+        pass
+
+
+def save_state():
+    """Persist durable state. Caller must hold STATE_LOCK."""
+    if DEMO:
+        return
+    try:
+        with open(STATE_PATH, "w") as f:
+            json.dump({k: STATE[k] for k in DURABLE_KEYS}, f)
+    except OSError:
+        pass
+
+
+def push_event(text):
+    with STATE_LOCK:
+        STATE["events"].insert(0, {"at": time.time(), "text": str(text)[:160]})
+        STATE["events"] = STATE["events"][:30]
+        save_state()
+
+
+def batch_totals():
+    """Caller must hold STATE_LOCK."""
+    people = len(STATE["batch"])
+    count = 0
+    est = 0.0
+    priced = False
+    for entry in STATE["batch"]:
+        for it in entry["items"]:
+            qty = float(it.get("quantity", 1))
+            count += qty
+            if isinstance(it.get("est"), (int, float)):
+                priced = True
+                est += it["est"] * qty
+    return {"people": people, "items": clean_qty(count),
+            "est_subtotal": round(est, 2) if priced else None}
+
+
+def batch_join(body):
+    person = str(body.get("person") or body.get("name") or "someone").strip()[:40] or "someone"
+    items = []
+    for entry in body.get("items") or []:
+        name = str(entry.get("name", "")).strip()
+        if not name:
+            continue
+        qty = entry.get("quantity", 1)
+        if not isinstance(qty, (int, float)) or qty <= 0:
+            qty = 1
+        item = {"name": name, "quantity": qty}
+        est = entry.get("est")
+        if isinstance(est, (int, float)) and est > 0:
+            item["est"] = est
+        items.append(item)
+    if not items and body.get("text"):
+        items = parse_order_text(str(body["text"]))
+    if not items:
+        return 400, {"ok": False, "error": "No items given. Send {\"person\", \"text\"} "
+                     "or {\"person\", \"items\": [{\"name\", \"quantity\"}]}."}
+    entry = {"person": person, "items": items, "joined_at": time.time()}
+    if body.get("chat_id"):  # iMessage joiners get notified when the batch fires
+        entry["chat_id"] = str(body["chat_id"])
+    with STATE_LOCK:
+        STATE["batch"].append(entry)
+        save_state()
+        totals = batch_totals()
+    plural = "s" if len(items) != 1 else ""
+    push_event(f"{person} joined the batch with {len(items)} item{plural}")
+    return 200, {"ok": True, **totals}
+
+
+def add_deal(body):
+    title = str(body.get("title", "")).strip()
+    if not title:
+        return 400, {"ok": False, "error": "deal needs a title"}
+    store = str(body.get("store", "")).strip() or None
+    threshold = body.get("threshold")
+    if not isinstance(threshold, (int, float)) or threshold <= 0:
+        threshold = None
+    with STATE_LOCK:
+        STATE["deals"].insert(0, {"store": store, "title": title, "threshold": threshold,
+                                  "posted_by": str(body.get("posted_by", "")).strip() or None})
+        STATE["deals"] = STATE["deals"][:8]
+        save_state()
+    push_event(f"New deal: {title}" + (f" at {store}" if store else ""))
+    return 200, {"ok": True}
+
+
+def set_timer(body):
+    minutes = body.get("minutes")
+    if not isinstance(minutes, (int, float)) or minutes <= 0 or minutes > 24 * 60:
+        return 400, {"ok": False, "error": "minutes must be between 0 and 1440"}
+    with STATE_LOCK:
+        STATE["next_fire_at"] = time.time() + minutes * 60
+        save_state()
+    push_event(f"Next order moved to T-{clean_qty(minutes)} min")
+    return 200, {"ok": True, "next_fire_at": STATE["next_fire_at"]}
+
+
+def fire_batch():
+    """Merge everyone's items and send the combined order to the cart."""
+    with STATE_LOCK:
+        entries = list(STATE["batch"])
+        deals = list(STATE["deals"])
+    merged = {}
+    for entry in entries:
+        for it in entry["items"]:
+            key = it["name"].strip().lower()
+            slot = merged.setdefault(key, {"name": it["name"], "quantity": 0})
+            slot["quantity"] += it["quantity"]
+    body = {"items": [{"name": v["name"], "quantity": clean_qty(v["quantity"])}
+                      for v in merged.values()]}
+    if deals and deals[0].get("store"):
+        body["store_name"] = deals[0]["store"]
+    push_event(f"Timer hit zero, sending {len(body['items'])} items for {len(entries)} people")
+    try:
+        _, result = place_bulk_order(body)
+    except DDError as e:
+        result = {"ok": False, "error": str(e)}
+    except Exception as e:
+        result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    with STATE_LOCK:
+        STATE["last_order"] = result
+        if result.get("ok"):
+            STATE["batch"] = []
+        save_state()
+    if result.get("ok"):
+        push_event(f"Order sent to the {result.get('store_name')} cart, review and check out")
+    else:
+        push_event(f"Order failed: {result.get('error')} (batch kept)")
+    # Text the iMessage joiners how their run went.
+    for chat_id in {e.get("chat_id") for e in entries if e.get("chat_id")}:
+        if result.get("ok"):
+            send_linq_message(chat_id,
+                              f"Group order sent — the {result.get('store_name')} cart "
+                              f"has everyone's items. Pickup at {DROP_POINT['name']}.")
+        else:
+            send_linq_message(chat_id,
+                              f"Group order hit a snag: {result.get('error')} "
+                              "Your items are still in the batch for the next run.")
+
+
+def timer_loop():
+    while True:
+        time.sleep(5)
+        with STATE_LOCK:
+            due = STATE["next_fire_at"] and time.time() >= STATE["next_fire_at"]
+            has_items = bool(STATE["batch"])
+        if not due:
+            continue
+        if DEMO:
+            push_event("Demo mode: timer hit zero, the order would go out now")
+        elif has_items:
+            fire_batch()
+        else:
+            push_event("Timer hit zero with an empty batch, rolling over")
+        with STATE_LOCK:
+            STATE["next_fire_at"] = time.time() + BATCH_MINUTES * 60
+            save_state()
+
+
+# Demo driver: loops store -> drop point so the map has something to show.
+DEMO_STORE = {"name": "Whole Foods Market, 125th St", "lat": 40.8090, "lng": -73.9482}
+DEMO_DRIVER_LOOP = 240.0
+
+
+def demo_route():
+    return [
+        {"lat": DEMO_STORE["lat"], "lng": DEMO_STORE["lng"]},
+        {"lat": 40.8098, "lng": -73.9531},
+        {"lat": 40.8135, "lng": -73.9585},
+        {"lat": 40.8110, "lng": -73.9603},
+        {"lat": 40.8087, "lng": -73.9620},
+        {"lat": DROP_POINT["lat"], "lng": DROP_POINT["lng"]},
+    ]
+
+
+def driver_snapshot():
+    if not DEMO:
+        return {"active": False}
+    route = demo_route()
+    t = (time.time() % DEMO_DRIVER_LOOP) / DEMO_DRIVER_LOOP
+    if t < 0.2:
+        phase, pos, eta = "SHOPPING", route[0], 9
+    elif t < 0.9:
+        p = (t - 0.2) / 0.7
+        seg = p * (len(route) - 1)
+        i = min(int(seg), len(route) - 2)
+        f = seg - i
+        pos = {"lat": route[i]["lat"] + (route[i + 1]["lat"] - route[i]["lat"]) * f,
+               "lng": route[i]["lng"] + (route[i + 1]["lng"] - route[i]["lng"]) * f}
+        phase, eta = "EN ROUTE", max(1, round((1 - p) * 8))
+    else:
+        phase, pos, eta = "AT DROP", route[-1], 0
+    return {"active": True, "name": "Marcus D.", "phase": phase, "eta_min": eta,
+            "lat": pos["lat"], "lng": pos["lng"], "store": DEMO_STORE["name"],
+            "route": [[r["lat"], r["lng"]] for r in route]}
+
+
+def imessage_snapshot():
+    """Pending confirmations + recent confirmed iMessage orders for the UI."""
+    now = time.time()
+    with PENDING_LOCK:
+        awaiting = [{"person": batch_person(p.get("sender")),
+                     "summary": p["summary"],
+                     "age_seconds": int(now - p["created"])}
+                    for p in PENDING_ORDERS.values()
+                    if now - p["created"] <= PENDING_TTL]
+    return {"awaiting": awaiting, "recent": list(ORDERS)[:6]}
+
+
+def dashboard_payload():
+    with STATE_LOCK:
+        payload = {
+            "now": time.time(),
+            "next_fire_at": STATE["next_fire_at"],
+            "drop_point": DROP_POINT,
+            "batch": STATE["batch"],
+            "batch_totals": batch_totals(),
+            "deals": STATE["deals"],
+            "events": STATE["events"],
+            "last_order": STATE["last_order"],
+            "demo": DEMO,
+        }
+    payload["driver"] = driver_snapshot()
+    payload["imessage"] = imessage_snapshot()
+    return payload
+
+
+def seed_demo():
+    now = time.time()
+    STATE["next_fire_at"] = now + 11 * 60 + 23
+    STATE["deals"] = [
+        {"store": "Whole Foods", "title": "$20 off $75+ storewide", "threshold": 75,
+         "posted_by": "Sarah"},
+        {"store": "Safeway", "title": "40% off first grocery order", "threshold": 60,
+         "posted_by": "Jake"},
+        {"store": "Westside Market", "title": "Free delivery over $35", "threshold": 35,
+         "posted_by": None},
+    ]
+    STATE["batch"] = [
+        {"person": "Sarah", "joined_at": now - 1500, "items": [
+            {"name": "oat milk", "quantity": 2, "est": 5.49},
+            {"name": "large eggs", "quantity": 1, "est": 6.99},
+            {"name": "sourdough bread", "quantity": 1, "est": 5.79}]},
+        {"person": "Jake", "joined_at": now - 1100, "items": [
+            {"name": "chicken thighs", "quantity": 2, "est": 8.49},
+            {"name": "jasmine rice", "quantity": 1, "est": 4.29},
+            {"name": "hot sauce", "quantity": 1, "est": 3.99}]},
+        {"person": "Priya", "joined_at": now - 700, "items": [
+            {"name": "greek yogurt", "quantity": 3, "est": 1.79},
+            {"name": "bananas", "quantity": 6, "est": 0.29},
+            {"name": "peanut butter", "quantity": 1, "est": 4.99}]},
+        {"person": "Toby", "joined_at": now - 300, "items": [
+            {"name": "cold brew concentrate", "quantity": 1, "est": 9.99}]},
+    ]
+    STATE["events"] = [
+        {"at": now - 300, "text": "Toby joined the batch with 1 item"},
+        {"at": now - 700, "text": "Priya joined the batch with 3 items"},
+        {"at": now - 900, "text": "New deal: 40% off first grocery order at Safeway"},
+        {"at": now - 1100, "text": "Jake joined the batch with 3 items"},
+        {"at": now - 1500, "text": "Sarah joined the batch with 3 items"},
+        {"at": now - 1600, "text": "New deal: $20 off $75+ storewide at Whole Foods"},
+        {"at": now - 1700, "text": f"Batch opened, drop point: {DROP_POINT['name']}"},
+    ]
+
+
+# --- Linq iMessage agent -----------------------------------------------------
+
+CHITCHAT_WORDS = {
+    "thanks", "thank", "you", "thx", "ty", "ok", "okay", "k", "kk", "cool",
+    "great", "awesome", "perfect", "nice", "good", "yes", "yeah", "yep", "no",
+    "nope", "hi", "hello", "hey", "yo", "sup", "bye", "goodbye", "later",
+    "lol", "haha", "hahaha", "omg", "pls", "please", "sure", "np", "welcome",
+    "morning", "night", "gn", "gm", "u", "it", "got", "sounds", "see", "soon",
+    "the", "that", "this", "a", "so", "and", "will", "do", "done", "all",
+    "much", "very", "really", "appreciate", "appreciated", "i", "i'm", "im",
+    "my", "your", "for", "man", "bro", "dude", "one", "sec", "min", "wait",
+    "on", "way", "here", "there", "love", "what", "when", "where", "is",
+    "be", "are", "was", "how", "why", "who", "can", "could", "would",
+    "should", "of", "in", "at", "to", "we", "they", "me", "us", "not",
+}
+
+
+def looks_like_chitchat(text):
+    """True for courtesy/conversational texts that must not become orders."""
+    words = re.findall(r"[a-z']+", text.lower())
+    if not words:
+        return True  # emoji- or punctuation-only message
+    return all(w in CHITCHAT_WORDS for w in words)
+
+
+def message_to_order_text(text):
+    """Turn a chat message into one-item-per-line order text."""
+    text = re.sub(r"^\s*(?:please\s+)?(?:order|buy|get(?:\s+me)?|add)\b[:,]?\s*",
+                  "", text.strip(), flags=re.I)
+    if "\n" not in text and re.search(r"[,;]", text):
+        parts = [p.strip() for p in re.split(r"[,;]", text) if p.strip()]
+        # "milk, 2" is quantity syntax for one item — only split real lists
+        if parts and not any(re.fullmatch(r"\d+(?:\.\d+)?", p) for p in parts):
+            text = "\n".join(parts)
+    return text
+
 
 TEXT_KEYS = ("text", "body", "content", "note", "notes", "description")
 CONTAINER_KEYS = ("message", "data", "payload", "event", "object", "conversation")
@@ -343,41 +694,6 @@ def find_message_text(obj, depth=0):
     return None
 
 
-def message_to_order_text(text):
-    """Turn a chat message into one-item-per-line order text."""
-    text = re.sub(r"^\s*(?:please\s+)?(?:order|buy|get(?:\s+me)?|add)\b[:,]?\s*",
-                  "", text.strip(), flags=re.I)
-    if "\n" not in text and re.search(r"[,;]", text):
-        parts = [p.strip() for p in re.split(r"[,;]", text) if p.strip()]
-        # "milk, 2" is quantity syntax for one item — only split real lists
-        if parts and not any(re.fullmatch(r"\d+(?:\.\d+)?", p) for p in parts):
-            text = "\n".join(parts)
-    return text
-
-
-CHITCHAT_WORDS = {
-    "thanks", "thank", "you", "thx", "ty", "ok", "okay", "k", "kk", "cool",
-    "great", "awesome", "perfect", "nice", "good", "yes", "yeah", "yep", "no",
-    "nope", "hi", "hello", "hey", "yo", "sup", "bye", "goodbye", "later",
-    "lol", "haha", "hahaha", "omg", "pls", "please", "sure", "np", "welcome",
-    "morning", "night", "gn", "gm", "u", "it", "got", "sounds", "see", "soon",
-    "the", "that", "this", "a", "so", "and", "will", "do", "done", "all",
-    "much", "very", "really", "appreciate", "appreciated", "i", "i'm", "im",
-    "my", "your", "for", "man", "bro", "dude", "one", "sec", "min", "wait",
-    "on", "way", "here", "there", "love", "what", "when", "where", "is",
-    "be", "are", "was", "how", "why", "who", "can", "could", "would",
-    "should", "of", "in", "at", "to", "we", "they", "me", "us", "not",
-}
-
-
-def looks_like_chitchat(text):
-    """True for courtesy/conversational texts that must not become orders."""
-    words = re.findall(r"[a-z']+", text.lower())
-    if not words:
-        return True  # emoji- or punctuation-only message
-    return all(w in CHITCHAT_WORDS for w in words)
-
-
 def extract_order_payload(payload):
     """Map an arbitrary webhook payload onto a place_bulk_order() body."""
     if not isinstance(payload, dict):
@@ -392,54 +708,6 @@ def extract_order_payload(payload):
         if isinstance(payload.get(k), (str, int)):
             body[k] = str(payload[k])
     return body
-
-
-def linq_signing_secrets():
-    """All configured signing secrets — Linq issues one per subscription."""
-    found = []
-    if os.environ.get("LINQ_SIGNING_SECRET"):
-        found.append(os.environ["LINQ_SIGNING_SECRET"])
-    try:
-        with open(os.path.join(BASE_DIR, ".linq_signing_secret")) as f:
-            found += [line.strip() for line in f if line.strip()]
-    except OSError:
-        pass
-    return found
-
-
-def verify_linq_signature(headers, raw_body):
-    """Standard-Webhooks HMAC check; enforced only when a secret is configured."""
-    secrets_list = linq_signing_secrets()
-    if not secrets_list:
-        return True  # the URL path token is the gate
-    msg_id = headers.get("webhook-id") or ""
-    ts = headers.get("webhook-timestamp") or ""
-    signed = f"{msg_id}.{ts}.".encode() + raw_body
-    sig_header = (headers.get("webhook-signature")
-                  or headers.get("X-Webhook-Signature") or "")
-    for secret in secrets_list:
-        key = secret[6:] if secret.startswith("whsec_") else secret
-        try:
-            key_bytes = base64.b64decode(key + "=" * (-len(key) % 4))
-        except Exception:
-            key_bytes = key.encode()
-        expected = base64.b64encode(
-            hmac.new(key_bytes, signed, hashlib.sha256).digest()).decode()
-        if any(hmac.compare_digest(c.partition(",")[2], expected)
-               for c in sig_header.split()):
-            return True
-    return False
-
-
-def linq_api_token():
-    token = os.environ.get("LINQ_API_TOKEN")
-    if token:
-        return token
-    try:
-        with open(os.path.join(BASE_DIR, ".linq_api_token")) as f:
-            return f.read().strip()
-    except OSError:
-        return None
 
 
 def normalize_phone(value):
@@ -494,6 +762,12 @@ def find_sender(obj, depth=0):
     return None
 
 
+def batch_person(sender):
+    """Roster-friendly label for an iMessage sender (masked number)."""
+    digits = re.sub(r"\D", "", str(sender or ""))
+    return f"iMessage …{digits[-4:]}" if len(digits) >= 4 else "iMessage friend"
+
+
 CHAT_ID_KEYS = ("chat_id", "chatId", "conversation_id", "conversationId")
 
 
@@ -515,6 +789,17 @@ def find_chat_id(obj, depth=0):
             if found:
                 return found
     return None
+
+
+def linq_api_token():
+    token = os.environ.get("LINQ_API_TOKEN")
+    if token:
+        return token
+    try:
+        with open(os.path.join(BASE_DIR, ".linq_api_token")) as f:
+            return f.read().strip()
+    except OSError:
+        return None
 
 
 def send_read_receipt(chat_id):
@@ -660,34 +945,6 @@ def resolve_bulk(body, items):
             "delivery_address": gl.get("delivery_address")}
 
 
-def execute_pending(pending):
-    """Place a confirmed pending order, falling back to other stores if closed."""
-    try:
-        added, existing = add_to_cart(pending["store_id"], pending["menu_id"],
-                                      pending["resolved"])
-        return build_response(added, existing, pending["resolved"],
-                              pending["notes"], pending["items"],
-                              pending["store_id"], pending["store_name"],
-                              pending.get("delivery_address"))
-    except DDError as e:
-        if not is_store_closed(e):
-            raise
-    tried = {pending["store_id"]}
-    for alt_id, alt_name in pending.get("alt_stores", [])[:6]:
-        if alt_id in tried:
-            continue
-        tried.add(alt_id)
-        note = (f"{pending['store_name']} wasn't accepting orders, "
-                f"used {alt_name} instead")
-        try:
-            return order_at_store(alt_id, alt_name, pending["items"], [note])
-        except DDError as e:
-            if is_store_closed(e):
-                continue
-            raise
-    raise DDError("No nearby store is accepting this order right now.")
-
-
 def preview_items(resolved):
     return [{"name": it["name"], "quantity": clean_qty(it.get("quantity", 1)),
              "price": it.get("price"), "unit": it.get("measurement_unit")}
@@ -709,20 +966,32 @@ def summarize_resolved(res):
     return f"From {res['store_name']}:\n" + "\n".join(lines)
 
 
+def minutes_to_fire():
+    with STATE_LOCK:
+        nf = STATE["next_fire_at"]
+    if not nf:
+        return None
+    return max(1, round((nf - time.time()) / 60))
+
+
 def compose_confirm_text(res, summary):
     """Have Claude write the confirmation iMessage; template on failure."""
     total = approx_total(res["resolved"])
+    mins = minutes_to_fire()
+    when = f"in about {mins} minutes" if mins else "soon"
     notes = "; ".join(n for n in res.get("notes") or [] if n)
-    fallback = (f"Here's your DoorDash order —\n{summary}\n"
+    fallback = (f"Here's what I found —\n{summary}\n"
                 + (f"Note: {notes}\n" if notes else "")
-                + f"Approx total ${total:.2f} before fees. "
-                  "Reply YES to confirm or NO to cancel.")
+                + f"Est ${total:.2f} before fees. The next group run goes out "
+                  f"{when} (drop: {DROP_POINT['name']}). "
+                  "Reply YES to hop on or NO to cancel.")
     try:
         out = ask_claude(
             "Write a short, friendly plain-text iMessage to a customer confirming "
-            "their DoorDash grocery order BEFORE it is placed. List every item with "
-            "quantity and price, name the store, give the approximate total "
-            f"${total:.2f} before fees"
+            "their grocery order BEFORE it joins a shared group DoorDash run. List "
+            "every item with quantity and price, name the store, give the "
+            f"approximate total ${total:.2f} before fees, and say the group order "
+            f"goes out {when} with pickup at {DROP_POINT['name']}"
             + (f", and mention this note: {notes}" if notes else "")
             + ". End by asking them to reply YES to confirm or NO to cancel. "
             f"Reply ONLY with the message text.\n\nOrder:\n{summary}")
@@ -731,15 +1000,7 @@ def compose_confirm_text(res, summary):
         return fallback
 
 
-def ack_text(result):
-    items = result.get("resolved") or []
-    note = f" Note: {result['notes']}." if result.get("notes") else ""
-    return (f"Order confirmed — added {len(items)} item(s) to your DoorDash cart "
-            f"at {result.get('store_name')}, approx ${approx_total(items):.2f} "
-            f"before fees.{note} Review and check out in the DoorDash app.")
-
-
-def handle_conversation(chat_id, text, params, entry):
+def handle_conversation(chat_id, text, sender, params, entry):
     """Background worker: interpret a text, reply, and manage the confirm loop."""
     try:
         now = time.time()
@@ -757,25 +1018,36 @@ def handle_conversation(chat_id, text, params, entry):
         entry["intent"] = kind
 
         if kind == "confirm" and pending:
-            entry["status"] = "ordering"
-            _, result = execute_pending(pending)
+            person = batch_person(pending.get("sender") or sender)
+            _, result = batch_join({"person": person,
+                                    "items": pending["batch_items"],
+                                    "chat_id": chat_id})
             with PENDING_LOCK:
                 PENDING_ORDERS.pop(chat_id, None)
-            entry["status"] = "done" if result.get("ok") else "failed"
-            entry["result"] = result
             if result.get("ok"):
+                est = approx_total(pending["resolved"])
                 ORDERS.appendleft({
                     "confirmed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "chat_id": chat_id,
-                    "store_name": result.get("store_name"),
-                    "cart_uuid": result.get("cart_uuid"),
-                    "resolved": result.get("resolved"),
-                    "notes": result.get("notes"),
-                    "appended_to_existing_cart": result.get("appended_to_existing_cart"),
+                    "person": person,
+                    "items": pending["batch_items"],
+                    "est_total": round(est, 2),
+                    "store_hint": pending.get("store_name"),
+                    "status": "joined_batch",
                 })
-                send_linq_message(chat_id, ack_text(result))
+                mins = minutes_to_fire()
+                when = f"in ~{mins} min" if mins else "soon"
+                entry["status"] = "done"
+                entry["result"] = {"ok": True, "joined_batch": True,
+                                   "person": person, "est_total": round(est, 2)}
+                send_linq_message(chat_id,
+                                  f"You're on the run — {len(pending['batch_items'])} "
+                                  f"item(s), est ${est:.2f}. The group order goes out "
+                                  f"{when} (pickup: {DROP_POINT['name']}). "
+                                  "I'll text you when it's sent.")
             else:
-                send_linq_message(chat_id, "Sorry — couldn't place the order: "
+                entry["status"] = "failed"
+                entry["result"] = result
+                send_linq_message(chat_id, "Sorry — couldn't add you to the run: "
                                   f"{result.get('error')}")
         elif kind == "cancel" and pending:
             with PENDING_LOCK:
@@ -794,13 +1066,33 @@ def handle_conversation(chat_id, text, params, entry):
             body = {k: params[k][0] for k in ("store_id", "store_name")
                     if params.get(k)}
             res = resolve_bulk(body, items)
+            # batch entries keep the short requested names; est comes from
+            # the resolution when it lines up 1:1
+            if len(res["resolved"]) == len(items):
+                batch_items = []
+                for i, it in enumerate(items):
+                    b = {"name": it["name"], "quantity": clean_qty(it["quantity"])}
+                    price = res["resolved"][i].get("price")
+                    if isinstance(price, (int, float)) and price > 0:
+                        b["est"] = price
+                    batch_items.append(b)
+            else:
+                batch_items = [{"name": it["name"][:40],
+                                "quantity": clean_qty(it.get("quantity", 1)),
+                                **({"est": it["price"]}
+                                   if isinstance(it.get("price"), (int, float))
+                                   and it["price"] > 0 else {})}
+                               for it in res["resolved"]]
             summary = summarize_resolved(res)
             confirm_msg = compose_confirm_text(res, summary)
             with PENDING_LOCK:
                 PENDING_ORDERS[chat_id] = {**res, "items": items,
+                                           "batch_items": batch_items,
+                                           "sender": sender,
                                            "created": time.time(),
                                            "summary": summary}
             sent = send_linq_message(chat_id, confirm_msg)
+            push_event(f"{batch_person(sender)} texted an order, awaiting YES")
             entry["status"] = "awaiting_confirmation"
             entry["result"] = {"ok": True, "store_name": res["store_name"],
                                "resolved": preview_items(res["resolved"]),
@@ -818,6 +1110,43 @@ def handle_conversation(chat_id, text, params, entry):
             pass
 
 
+def linq_signing_secrets():
+    """All configured signing secrets — Linq issues one per subscription."""
+    found = []
+    if os.environ.get("LINQ_SIGNING_SECRET"):
+        found.append(os.environ["LINQ_SIGNING_SECRET"])
+    try:
+        with open(os.path.join(BASE_DIR, ".linq_signing_secret")) as f:
+            found += [line.strip() for line in f if line.strip()]
+    except OSError:
+        pass
+    return found
+
+
+def verify_linq_signature(headers, raw_body):
+    """Standard-Webhooks HMAC check; enforced only when a secret is configured."""
+    secrets_list = linq_signing_secrets()
+    if not secrets_list:
+        return True  # the URL path token is the gate
+    msg_id = headers.get("webhook-id") or ""
+    ts = headers.get("webhook-timestamp") or ""
+    signed = f"{msg_id}.{ts}.".encode() + raw_body
+    sig_header = (headers.get("webhook-signature")
+                  or headers.get("X-Webhook-Signature") or "")
+    for secret in secrets_list:
+        key = secret[6:] if secret.startswith("whsec_") else secret
+        try:
+            key_bytes = base64.b64decode(key + "=" * (-len(key) % 4))
+        except Exception:
+            key_bytes = key.encode()
+        expected = base64.b64encode(
+            hmac.new(key_bytes, signed, hashlib.sha256).digest()).decode()
+        if any(hmac.compare_digest(c.partition(",")[2], expected)
+               for c in sig_header.split()):
+            return True
+    return False
+
+
 def already_seen(event_id):
     """Dedup webhook retries (senders retry when we were slow once)."""
     if not event_id:
@@ -832,6 +1161,7 @@ def already_seen(event_id):
 
 
 def process_webhook_order(body, entry):
+    """Background worker for programmatic (non-chat) webhook payloads."""
     try:
         _, result = place_bulk_order(body)
         entry["status"] = "done" if result.get("ok") else "failed"
@@ -881,8 +1211,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.is_tunneled():  # everything except the webhook is local-only
             self.send_json(404, {"ok": False, "error": "not found"})
-        elif self.path in ("/", "/index.html"):
-            self.send_file(os.path.join(STATIC_DIR, "index.html"), "text/html; charset=utf-8")
+        elif self.path in ("/", "/index.html", "/dashboard", "/dashboard.html"):
+            self.send_file(os.path.join(STATIC_DIR, "dashboard.html"),
+                           "text/html; charset=utf-8")
+        elif self.path == "/api/dashboard":
+            self.handle_api(lambda: (200, dashboard_payload()))
         elif self.path == "/api/stores":
             self.handle_api(lambda: (200, run_dd("find-nearby-stores", "--max", "15")))
         elif self.path == "/api/carts":
@@ -890,35 +1223,54 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/webhook-log":
             self.send_json(200, {"ok": True, "log": list(WEBHOOK_LOG)})
         elif self.path == "/api/orders":
-            now = time.time()
-            with PENDING_LOCK:
-                pending = [{"chat_id": cid, "store_name": p["store_name"],
-                            "summary": p["summary"],
-                            "age_seconds": int(now - p["created"])}
-                           for cid, p in PENDING_ORDERS.items()
-                           if now - p["created"] <= PENDING_TTL]
+            snap = imessage_snapshot()
             self.send_json(200, {"ok": True, "orders": list(ORDERS),
-                                 "awaiting_confirmation": pending})
+                                 "awaiting_confirmation": snap["awaiting"]})
+        elif self.path.startswith("/assets/"):
+            rel = os.path.normpath(self.path.split("?", 1)[0].lstrip("/"))
+            path = os.path.join(STATIC_DIR, rel)
+            if rel.startswith("assets" + os.sep) and \
+                    os.path.abspath(path).startswith(STATIC_DIR + os.sep):
+                ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+                self.send_file(path, ctype)
+            else:
+                self.send_json(404, {"ok": False, "error": "not found"})
         else:
             self.send_json(404, {"ok": False, "error": "not found"})
+
+    POST_ROUTES = {
+        "/api/order": place_bulk_order,
+        "/api/batch/join": batch_join,
+        "/api/deals": add_deal,
+        "/api/timer": set_timer,
+    }
 
     def do_POST(self):
         path, _, query = self.path.partition("?")
         params = urllib.parse.parse_qs(query)
-        if path.rstrip("/") == "/api/order":
-            if self.is_tunneled() and not self.header_token_ok():
-                self.send_json(403, {"ok": False, "error": "missing or bad X-Webhook-Token"})
-                return
-            try:
-                body = json.loads(self.read_body() or b"{}")
-            except json.JSONDecodeError:
-                self.send_json(400, {"ok": False, "error": "invalid JSON body"})
-                return
-            self.handle_api(lambda: place_bulk_order(body))
-        elif path.startswith("/webhook/linq"):
+        if path.startswith("/webhook/linq"):
             self.handle_linq_webhook(path, params)
-        else:
+            return
+        if self.is_tunneled():
+            # Through the tunnel only /api/order is reachable, token-gated;
+            # batch/deals/timer stay local-only.
+            if path.rstrip("/") != "/api/order":
+                self.send_json(404, {"ok": False, "error": "not found"})
+                return
+            if not self.header_token_ok():
+                self.send_json(403, {"ok": False,
+                                     "error": "missing or bad X-Webhook-Token"})
+                return
+        route = self.POST_ROUTES.get(path.rstrip("/") or path)
+        if route is None:
             self.send_json(404, {"ok": False, "error": "not found"})
+            return
+        try:
+            body = json.loads(self.read_body() or b"{}")
+        except json.JSONDecodeError:
+            self.send_json(400, {"ok": False, "error": "invalid JSON body"})
+            return
+        self.handle_api(lambda: route(body))
 
     def handle_linq_webhook(self, path, params):
         token = path[len("/webhook/linq"):].strip("/") or \
@@ -970,7 +1322,7 @@ class Handler(BaseHTTPRequestHandler):
                              daemon=True).start()
 
         # Conversational path: a real chat we can reply into gets the
-        # Claude-driven confirm loop instead of ordering immediately.
+        # Claude-driven confirm loop; a YES joins the group batch.
         raw_text = find_message_text(payload)
         is_native = bool(payload.get("items") or payload.get("text"))
         if not is_native and chat_id and raw_text:
@@ -979,11 +1331,12 @@ class Handler(BaseHTTPRequestHandler):
                      "status": "interpreting", "result": None}
             WEBHOOK_LOG.appendleft(entry)
             threading.Thread(target=handle_conversation,
-                             args=(chat_id, raw_text, params, entry),
+                             args=(chat_id, raw_text, sender, params, entry),
                              daemon=True).start()
             self.send_json(202, {"ok": True, "marked_read": True,
                                  "note": "interpreting message; any order will be "
-                                         "confirmed over iMessage before it is placed"})
+                                         "confirmed over iMessage before it joins "
+                                         "the group run"})
             return
 
         body = extract_order_payload(payload)
@@ -1000,15 +1353,14 @@ class Handler(BaseHTTPRequestHandler):
                                  "ignored": "no order items found in message"})
             return
 
-        # Respond immediately — resolution takes ~a minute and webhook
-        # senders retry on timeout, which would double the order.
+        # Programmatic payloads order immediately in the background —
+        # webhook senders retry on timeout, which would double the order.
         entry = {"received_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                  "requested": items, "status": "processing", "result": None}
         WEBHOOK_LOG.appendleft(entry)
         threading.Thread(target=process_webhook_order, args=(body, entry),
                          daemon=True).start()
         self.send_json(202, {"ok": True, "accepted": items,
-                             "marked_read": bool(chat_id),
                              "note": "adding to your DoorDash cart in the background; "
                                      "see GET /api/webhook-log (local only) for the result"})
 
@@ -1027,8 +1379,18 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("PORT", 8765))
+    load_state()
+    if DEMO:
+        seed_demo()
+    with STATE_LOCK:
+        if not STATE["next_fire_at"] or STATE["next_fire_at"] < time.time():
+            STATE["next_fire_at"] = time.time() + BATCH_MINUTES * 60
+        save_state()
+    threading.Thread(target=timer_loop, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"Grocery Agent listening on http://127.0.0.1:{port}")
+    mode = " (demo mode)" if DEMO else ""
+    print(f"Grocery Agent listening on http://127.0.0.1:{port}{mode}")
+    print(f"Dashboard: http://127.0.0.1:{port}/dashboard")
     print(f"Webhook path (append to your public tunnel URL): /webhook/linq/{WEBHOOK_TOKEN}")
     server.serve_forever()
 
